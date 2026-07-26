@@ -28,17 +28,14 @@
 // Routing scratch buffers
 // -----------------------------------------------------------------------------
 
-static float g_logits[MAX_NUM_TOKENS][MAX_NUM_EXPERTS];
-// Store the ORIGINAL affinity sigmoid(logit). The load-balancing bias is used
-// only while selecting Top-K and must not enter the normalized gate weights.
-static float g_affinity[MAX_NUM_TOKENS][MAX_NUM_EXPERTS];
+// Router 只保留最终 Top-K 结果；logit/affinity 在 token 局部产生并立即消费，
+// 不再写入完整 [N,E] 中间矩阵。
 static int g_topk_indices[MAX_NUM_TOKENS][MAX_TOP_K];
 static float g_topk_weights[MAX_NUM_TOKENS][MAX_TOP_K];
 static int g_expert_token_count[MAX_NUM_EXPERTS];
 static int g_expert_token_list[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
-// 分发阶段同时保存路由权重与原 Top-K 槽位，专家回写时无需再次扫描 K。
+// 分发阶段直接保存路由权重，专家回写时无需再次扫描 K。
 static float g_expert_token_weight[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
-static uint8_t g_expert_topk_slot[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
 
 // -----------------------------------------------------------------------------
 // Compact runtime-layout activation/output buffers
@@ -228,34 +225,54 @@ void preprocess(MoEWeights& w) {
 // -----------------------------------------------------------------------------
 
 /**
- * @brief 计算每个 token 对每个路由专家的 FP32 Router logit。
+ * @brief 将一个专家候选插入当前 token 的有序 Top-K 列表。
  *
- * 功能：执行 z[t,e] = dot(x[t,:], w_router[e,:])，结果写入 g_logits。
- * Router 按实验要求保持 FP32，不参与 W8A8 专家矩阵的整数计算。
- *
- * 实现思路：外层遍历 token，AVX-512 路径每次并行处理 4 个专家，复用同一
- * 个 x 向量并维护 4 条独立 FMA 累加链；每条指令处理 16 个 FP32，最后通过
- * _mm512_reduce_add_ps 做水平归约。x 和 w_router 由普通 new[] 分配，
- * 不保证 64 字节对齐，因此必须使用 _mm512_loadu_ps，避免对齐加载异常。
- *
- * 向量化情况：
- * - 定义 __AVX512F__ 时：使用 AVX-512 FP32 FMA，每条向量处理 16 个元素；
- * - 未定义时：使用标量点积，保证普通编译器和非 AVX-512 平台可运行。
- *
- * @param x          输入 token，紧凑布局 [num_tokens,D]。
- * @param w          提供 FP32 Router 权重 w_router。
- * @param num_tokens token 数量。
- * @param D          模型隐藏维度。
- * @param E          路由专家数量。
+ * 专家按编号递增到达，且只有 score 严格更大时才前移，因此相同选择分数时
+ * 自动保持较小专家编号优先。affinity 与带 bias 的选择分数同时保存，最终
+ * 权重归一化只使用不含 bias 的 affinity。
  */
-static inline void compute_logits(const float* x, const MoEWeights& w,
-                                  int num_tokens, int D, int E) {
+static inline void insert_routing_candidate(
+    int expert, float affinity, float score, int K,
+    int* best_idx, float* best_affinity, float* best_score) {
+    int pos = K;
+    for (int k = 0; k < K; ++k) {
+        if (best_idx[k] < 0 || score > best_score[k]) {
+            pos = k;
+            break;
+        }
+    }
+    if (pos == K) return;
+
+    for (int k = K - 1; k > pos; --k) {
+        best_idx[k] = best_idx[k - 1];
+        best_affinity[k] = best_affinity[k - 1];
+        best_score[k] = best_score[k - 1];
+    }
+    best_idx[pos] = expert;
+    best_affinity[pos] = affinity;
+    best_score[pos] = score;
+}
+
+/**
+ * @brief 融合计算 Router logit、Sigmoid、Top-K 选择和路由权重归一化。
+ *
+ * 原实现先写完整 g_logits[N,E]，再写 g_affinity[N,E]，随后多次重新读取。
+ * 当前实现对每个 token 在局部完成全部 Router 流程，只保留最终 K 个专家，
+ * 从而消除两个大型中间矩阵以及相应的缓存/TLB流量。
+ *
+ * AVX-512 路径仍一次并行计算4个专家的点积并复用 x 向量；4个 logit 归约后
+ * 按专家编号顺序计算精确 expf/Sigmoid，并立即插入局部 Top-K。
+ */
+static inline void compute_routing(const float* x, const MoEWeights& w,
+                                   int num_tokens, int D, int E, int K) {
     for (int t = 0; t < num_tokens; ++t) {
         const float* x_t = x + (size_t)t * D;
+        int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
+        float best_affinity[MAX_TOP_K] = {};
+        float best_score[MAX_TOP_K] = {};
+
 #if defined(__AVX512F__)
         int e = 0;
-        // 一次计算 4 个专家：同一个 x_vec 被复用 4 次，减少输入向量重复加载，
-        // 同时形成 4 条互不依赖的 FMA 累加链，提高指令级并行度。
         for (; e + 3 < E; e += 4) {
             const float* r0 = w.w_router + (size_t)(e + 0) * D;
             const float* r1 = w.w_router + (size_t)(e + 1) * D;
@@ -273,13 +290,19 @@ static inline void compute_logits(const float* x, const MoEWeights& w,
                 acc2 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r2 + d), acc2);
                 acc3 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r3 + d), acc3);
             }
-            g_logits[t][e + 0] = _mm512_reduce_add_ps(acc0);
-            g_logits[t][e + 1] = _mm512_reduce_add_ps(acc1);
-            g_logits[t][e + 2] = _mm512_reduce_add_ps(acc2);
-            g_logits[t][e + 3] = _mm512_reduce_add_ps(acc3);
+
+            const float logits[4] = {
+                _mm512_reduce_add_ps(acc0), _mm512_reduce_add_ps(acc1),
+                _mm512_reduce_add_ps(acc2), _mm512_reduce_add_ps(acc3)};
+            for (int j = 0; j < 4; ++j) {
+                const float affinity =
+                    1.0f / (1.0f + expf(-logits[j]));
+                insert_routing_candidate(
+                    e + j, affinity, affinity + w.bias[e + j], K,
+                    best_idx, best_affinity, best_score);
+            }
         }
 
-        // E 不一定是 4 的倍数，处理最后 0~3 个专家。
         for (; e < E; ++e) {
             const float* r_e = w.w_router + (size_t)e * D;
             __m512 acc = _mm512_setzero_ps();
@@ -288,137 +311,29 @@ static inline void compute_logits(const float* x, const MoEWeights& w,
                 acc = _mm512_fmadd_ps(
                     xv, _mm512_loadu_ps(r_e + d), acc);
             }
-            g_logits[t][e] = _mm512_reduce_add_ps(acc);
+            const float logit = _mm512_reduce_add_ps(acc);
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(
+                e, affinity, affinity + w.bias[e], K,
+                best_idx, best_affinity, best_score);
         }
 #else
         for (int e = 0; e < E; ++e) {
             const float* r_e = w.w_router + (size_t)e * D;
-            float sum = 0.0f;
-            for (int d = 0; d < D; ++d) sum += r_e[d] * x_t[d];
-            g_logits[t][e] = sum;
+            float logit = 0.0f;
+            for (int d = 0; d < D; ++d) logit += r_e[d] * x_t[d];
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(
+                e, affinity, affinity + w.bias[e], K,
+                best_idx, best_affinity, best_score);
         }
 #endif
-    }
-}
 
-/**
- * @brief 计算 Sigmoid 亲和度，并按“亲和度 + 负载均衡偏置”选择 Top-K 专家。
- *
- * 功能：先计算 s[t,e] = sigmoid(g_logits[t,e])，再依据 s[t,e] + bias[e]
- * 选择 K 个专家。偏置只影响专家选择，绝不能进入后续路由权重归一化。
- *
- * 实现思路：K=2 一次扫描维护前两名，K=4 一次扫描维护有序前四名；
- * 其他 K 使用 used[] 逐轮选择。所有路径严格大于才替换，同分时小索引优先，
- * 与标量参考实现的 tie-break 规则一致。
- *
- * 向量化情况：未显式向量化。Sigmoid 依赖 expf，Top-K 又包含数据相关分支，
- * 当前保持标量实现以优先保证选择语义与参考版本一致。
- *
- * @param w          提供每个专家的负载均衡 bias。
- * @param num_tokens token 数量。
- * @param E          专家数量。
- * @param K          每个 token 选择的专家数量。
- */
-static inline void compute_affinity_and_topk(const MoEWeights& w,
-                                              int num_tokens, int E, int K) {
-    for (int t = 0; t < num_tokens; ++t) {
-        for (int e = 0; e < E; ++e) {
-            const float z = g_logits[t][e];
-            g_affinity[t][e] = 1.0f / (1.0f + expf(-z));
-        }
-
-        // K=2 是 S4 的固定热点：一次扫描同时维护第一、第二名。
-        // 按专家编号递增扫描且只在严格大于时替换，因此同分时仍是小索引优先。
-        if (K == 2) {
-            int best0 = -1;
-            int best1 = -1;
-            float score0 = 0.0f;
-            float score1 = 0.0f;
-            for (int e = 0; e < E; ++e) {
-                const float score = g_affinity[t][e] + w.bias[e];
-                if (best0 < 0 || score > score0) {
-                    best1 = best0;
-                    score1 = score0;
-                    best0 = e;
-                    score0 = score;
-                } else if (best1 < 0 || score > score1) {
-                    best1 = e;
-                    score1 = score;
-                }
-            }
-            g_topk_indices[t][0] = best0;
-            g_topk_indices[t][1] = best1;
-        } else if (K == 4) {
-            // S1/S3 的 Top-4 一次扫描插入排序，避免 4 次完整专家扫描以及
-            // used[MAX_NUM_EXPERTS] 的大数组清零。
-            int best_idx[4] = {-1, -1, -1, -1};
-            float best_score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (int e = 0; e < E; ++e) {
-                const float score = g_affinity[t][e] + w.bias[e];
-                int pos = 4;
-                for (int j = 0; j < 4; ++j) {
-                    if (best_idx[j] < 0 || score > best_score[j]) {
-                        pos = j;
-                        break;
-                    }
-                }
-                if (pos < 4) {
-                    for (int j = 3; j > pos; --j) {
-                        best_idx[j] = best_idx[j - 1];
-                        best_score[j] = best_score[j - 1];
-                    }
-                    best_idx[pos] = e;
-                    best_score[pos] = score;
-                }
-            }
-            for (int k = 0; k < 4; ++k) {
-                g_topk_indices[t][k] = best_idx[k];
-            }
-        } else {
-            // 通用 K 路径与参考实现一致：逐轮选择，严格大于保证小索引优先。
-            bool used[MAX_NUM_EXPERTS] = {};
-            for (int k = 0; k < K; ++k) {
-                int best = -1;
-                for (int e = 0; e < E; ++e) {
-                    if (used[e]) continue;
-                    if (best < 0 ||
-                        g_affinity[t][e] + w.bias[e] >
-                            g_affinity[t][best] + w.bias[best]) {
-                        best = e;
-                    }
-                }
-                used[best] = true;
-                g_topk_indices[t][k] = best;
-            }
-        }
-    }
-}
-
-/**
- * @brief 对选中专家的原始 Sigmoid 亲和度进行归一化，得到路由权重。
- *
- * 功能：对每个 token 计算
- *     gate[t,k] = affinity[t, topk[k]] / sum_selected_affinity。
- * 注意这里既不是 exp(logit) Softmax，也不能把负载均衡 bias 加入分母或分子。
- *
- * 实现思路：第一遍对 K 个选中专家求和，第二遍逐个除以总和并写入
- * g_topk_weights。由于实验 MAX_TOP_K=4，循环规模很小。
- *
- * 向量化情况：未显式向量化。K 最大仅为 4，使用 SIMD 的装载、掩码和归约
- * 开销通常高于收益，且这里不是主要计算热点。
- *
- * @param num_tokens token 数量。
- * @param K          Top-K 数量。
- */
-static inline void compute_topk_weights(int num_tokens, int K) {
-    for (int t = 0; t < num_tokens; ++t) {
-        float sum = 0.0f;
+        float affinity_sum = 0.0f;
+        for (int k = 0; k < K; ++k) affinity_sum += best_affinity[k];
         for (int k = 0; k < K; ++k) {
-            sum += g_affinity[t][g_topk_indices[t][k]];
-        }
-        for (int k = 0; k < K; ++k) {
-            g_topk_weights[t][k] =
-                g_affinity[t][g_topk_indices[t][k]] / sum;
+            g_topk_indices[t][k] = best_idx[k];
+            g_topk_weights[t][k] = best_affinity[k] / affinity_sum;
         }
     }
 }
@@ -448,7 +363,6 @@ static inline void dispatch_tokens_to_experts(int num_tokens, int E, int K) {
             const int slot = g_expert_token_count[e]++;
             g_expert_token_list[e][slot] = t;
             g_expert_token_weight[e][slot] = g_topk_weights[t][k];
-            g_expert_topk_slot[e][slot] = (uint8_t)k;
         }
     }
 }
@@ -948,15 +862,15 @@ static void matmul_small_m_or_packed(
  * 2. 使用输入 scale 与权重 scale 将 INT32 投影反量化为 FP32；
  * 3. 计算 SiLU(gate)*up，并逐 token 重新量化为 INT8；
  * 4. 批量执行 INT8 Down GEMM；
- * 5. 乘以 s_h*s_down，直接累加到已经包含残差 x 的 y。
+ * 5. 乘以 s_h*s_down，并与输入 x 融合写入 y，省去单独残差 memcpy。
  * 所有矩阵缓冲区均使用运行时 D/H 的紧凑行跨度，避免 MAX_* 二维数组造成
  * 的物理 stride 错误。
  *
  * 向量化情况：常规 Gate/Up/Down 使用 AMX；仅对计算量足够大的小 M 使用
  * AVX-512BW 专用路径。hidden 重量化和 Down 反量化使用 AVX-512。
  */
-static void compute_shared_expert(const MoEWeights& w, float* y,
-                                  int num_tokens, int D, int H) {
+static void compute_shared_expert(const float* x, const MoEWeights& w,
+                                  float* y, int num_tokens, int D, int H) {
     matmul_gate_up(
         g_quantized_x,
         g_packed_shared_gate, g_packed_shared_up,
@@ -991,6 +905,7 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
 
     for (int t = 0; t < num_tokens; ++t) {
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
+        const float* x_t = x + (size_t)t * D;
         float* y_t = y + (size_t)t * D;
         const int32_t* out_t = g_shared_down_out + (size_t)t * D;
 #if defined(__AVX512F__)
@@ -999,12 +914,12 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
             const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
             const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
             const __m512 contribution = _mm512_mul_ps(out_fp32, dequant_vec);
-            const __m512 y_vec = _mm512_loadu_ps(y_t + d);
-            _mm512_storeu_ps(y_t + d, _mm512_add_ps(y_vec, contribution));
+            const __m512 x_vec = _mm512_loadu_ps(x_t + d);
+            _mm512_storeu_ps(y_t + d, _mm512_add_ps(x_vec, contribution));
         }
 #else
         for (int d = 0; d < D; ++d) {
-            y_t[d] += (float)out_t[d] * dequant;
+            y_t[d] = x_t[d] + (float)out_t[d] * dequant;
         }
 #endif
     }
@@ -1020,9 +935,8 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
  * 激活和 INT32 累加；SiLU、scale 乘法以及最终专家加权在 FP32 中完成。
  *
  * 实现思路：
- * 1. memcpy 初始化残差 y=x；
- * 2. 计算 Router logit、Sigmoid、带 bias 的 Top-K 和无 bias 路由权重；
- * 3. 输入按 token 量化一次，并先计算共享专家；
+ * 1. 融合计算 Router logit、Sigmoid、Top-K 和路由权重；
+ * 2. 输入按 token 量化；共享专家输出与残差 x 融合写入 y；
  * 4. N=1 时直接按 Top-K 计算路由专家并返回；
  * 5. N>1 时按专家分发并将命中 token Gather 到紧凑 g_amx_A；
  * 6. 对聚拢后的 token 批量执行 Gate/Up AMX GEMM、SwiGLU 和隐藏重量化；
@@ -1123,14 +1037,10 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int E = w.num_experts;
     const int K = w.top_k;
 
-    std::memcpy(y, x, (size_t)num_tokens * D * sizeof(float));
-
-    compute_logits(x, w, num_tokens, D, E);
-    compute_affinity_and_topk(w, num_tokens, E, K);
-    compute_topk_weights(num_tokens, K);
+    compute_routing(x, w, num_tokens, D, E, K);
     quantize_input(x, num_tokens, D);
 
-    compute_shared_expert(w, y, num_tokens, D, H);
+    compute_shared_expert(x, w, y, num_tokens, D, H);
 
     // N=1 不需要按专家聚拢：直接按 Top-K 顺序计算，跳过计数器、列表、
     // 16/512 专家全扫描以及输入 Gather。
@@ -1192,9 +1102,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         for (int i = 0; i < count; ++i) {
             const int t = g_expert_token_list[e][i];
             const float route_weight = g_expert_token_weight[e][i];
-            // Top-K 槽位已在分发时保存，后续专家并行重构时可直接定位输出槽。
-            const uint8_t topk_slot = g_expert_topk_slot[e][i];
-            (void)topk_slot;
 
             const float dequant = g_gated_scale[i] * g_scale_down[e];
             float* y_t = y + (size_t)t * D;
