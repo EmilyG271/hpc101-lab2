@@ -1028,10 +1028,13 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
     // once per N-tile. 16-row blocks split work across threads AND enable the
     // fused gate/up path (reuse A-tile, halves A traffic). VTune showed
     // compute_shared_expert was 17.3% of S4 CPU time.
-    {
+    // R21b: small batches (S1/S2, N<64) keep the plain serial call -- the OMP
+    // parallel-for construct itself adds ~15% overhead on S2 even when the if()
+    // clause serializes it, because the runtime still enters the construct.
+    if (num_tokens >= OMP_TOKEN_THRESHOLD) {
         static thread_local bool shared_amx_perm_gu = false;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#pragma omp parallel for schedule(static)
 #endif
         for (int t0 = 0; t0 < num_tokens; t0 += 16) {
             if (g_amx_runtime_enabled && !shared_amx_perm_gu)
@@ -1045,6 +1048,13 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
                 g_shared_up_out + (size_t)t0 * H,
                 m, D, H);
         }
+    } else {
+        matmul_gate_up(
+            g_quantized_x,
+            g_packed_shared_gate, g_packed_shared_up,
+            w.sh_gate, w.sh_up,
+            g_shared_gate_out, g_shared_up_out,
+            num_tokens, D, H);
     }
 
 #if defined(_OPENMP)
@@ -1090,10 +1100,11 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
     // R21: parallelize shared-expert Down GEMM over 16-token blocks (same
     // L2-bandwidth rationale as Gate/Up; AMX permission is per-thread-persistent,
     // so the check is a no-op after the Gate/Up region set it).
-    {
+    // R21b: small batches keep the plain serial call (same rationale as Gate/Up).
+    if (num_tokens >= OMP_TOKEN_THRESHOLD) {
         static thread_local bool shared_amx_perm_dn = false;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#pragma omp parallel for schedule(static)
 #endif
         for (int t0 = 0; t0 < num_tokens; t0 += 16) {
             if (g_amx_runtime_enabled && !shared_amx_perm_dn)
@@ -1105,6 +1116,10 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
                 g_shared_down_out + (size_t)t0 * D,
                 m, H, D);
         }
+    } else {
+        matmul_small_m_or_packed(
+            g_shared_quantized_gated, g_packed_shared_down, w.sh_down,
+            g_shared_down_out, num_tokens, H, D);
     }
 
 #if defined(_OPENMP)
