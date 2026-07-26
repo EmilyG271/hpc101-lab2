@@ -107,6 +107,53 @@ alignas(64) static thread_local unsigned char g_tile_cfg[64];
 static thread_local int g_last_tile_rows = -1;
 #endif
 static bool g_amx_runtime_enabled = false;
+
+// 每线程独立 GEMM scratch（专家并行用）
+#if defined(_OPENMP)
+struct ExpertScratch {
+    int8_t*  A = nullptr;
+    int32_t* gate_out = nullptr;
+    int32_t* up_out = nullptr;
+    float*   gated_fp32 = nullptr;
+    int8_t*  quantized_gated = nullptr;
+    float*   gated_scale = nullptr;
+    int32_t* down_out = nullptr;
+    size_t   cap = 0;
+    bool     amx_perm = false;
+
+    static void* xalloc(size_t n) {
+        void* p = nullptr;
+        size_t sz = (n + 63) & ~((size_t)63);
+        if (posix_memalign(&p, 64, sz) != 0) return nullptr;
+        return p;
+    }
+    void ensure(size_t max_rows, size_t D, size_t H) {
+        size_t maxdim = (D > H) ? D : H;
+        size_t need = max_rows * maxdim;
+        if (need <= cap) return;
+        free_all();
+        A               = (int8_t*)  xalloc(need);
+        gate_out        = (int32_t*) xalloc(need * 4);
+        up_out          = (int32_t*) xalloc(need * 4);
+        gated_fp32      = (float*)   xalloc(need * 4);
+        quantized_gated = (int8_t*)  xalloc(need);
+        down_out        = (int32_t*) xalloc(need * 4);
+        gated_scale     = (float*)   xalloc(max_rows * 4);
+        cap = need;
+    }
+    void free_all() {
+        free(A); free(gate_out); free(up_out); free(gated_fp32);
+        free(quantized_gated); free(down_out); free(gated_scale);
+        A = nullptr; gate_out = nullptr; up_out = nullptr;
+        gated_fp32 = nullptr; quantized_gated = nullptr;
+        down_out = nullptr; gated_scale = nullptr;
+        cap = 0;
+    }
+    ~ExpertScratch() { free_all(); }
+};
+static thread_local ExpertScratch tl_scratch;
+#endif
+
 // 小批量保持串行，避免 OpenMP 团队创建/调度开销影响 S1、S2。
 static constexpr int OMP_TOKEN_THRESHOLD = 64;
 
@@ -1025,8 +1072,128 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
  * 直接按 Top-K 排名顺序计算被选中的专家；S1 直接调用分离 AMX，S2 仍保留
  * K×N 达阈值时的 AVX-512BW 小 M kernel。
  */
+// R6: 单 token 路径按 K 专家并行。每线程用独立 tl_scratch(M=1)，
+// 各专家把"反量化×路由权重"的输出写到独立 y_acc[k]，最后串行归约到 y。
+// 复用 R5 的 thread_local ExpertScratch 与 AMX 权限缓存。
+#if defined(_OPENMP)
+alignas(64) static float g_single_yacc[MAX_TOP_K][MAX_D_MODEL];
+static void compute_single_token_routed_experts_parallel(
+    const MoEWeights& w, float* y, int D, int H, int K, int nthreads) {
+    const int8_t* xq = g_quantized_x;
+    const float x_scale = g_x_scale[0];
+    const size_t expert_elems = (size_t)D * H;
+    const int use_small_gate_up = should_use_small_m_kernel(1, D, H);
+    const int use_small_down = should_use_small_m_kernel(1, H, D);
+    const int nt = (nthreads < K) ? nthreads : K;
+
+#pragma omp parallel num_threads(nt)
+    {
+        if (g_amx_runtime_enabled && !tl_scratch.amx_perm)
+            tl_scratch.amx_perm = request_amx_permission();
+        tl_scratch.ensure(1, (size_t)D, (size_t)H);
+
+#pragma omp for schedule(static)
+        for (int k = 0; k < K; ++k) {
+            const int e = g_topk_indices[0][k];
+            const float route_weight = g_topk_weights[0][k];
+            const int8_t* w_gate_e = w.w_gate + (size_t)e * expert_elems;
+            const int8_t* w_up_e = w.w_up + (size_t)e * expert_elems;
+            const int8_t* w_down_e = w.w_down + (size_t)e * expert_elems;
+            float* y_acc = g_single_yacc[k];
+
+            if (use_small_gate_up) {
+                small_m_gate_up_output_major(
+                    xq, w_gate_e, w_up_e,
+                    tl_scratch.gate_out, tl_scratch.up_out, 1, D, H);
+            } else {
+                matmul_packed(xq, g_packed_gate[e], tl_scratch.gate_out, 1, D, H);
+                matmul_packed(xq, g_packed_up[e], tl_scratch.up_out, 1, D, H);
+            }
+
+            const float scale_g = g_scale_gate[e] * x_scale;
+            const float scale_u = g_scale_up[e] * x_scale;
+            float max_abs = 0.0f;
+#if defined(__AVX512F__)
+            {
+                const __m512 sg = _mm512_set1_ps(scale_g);
+                const __m512 su = _mm512_set1_ps(scale_u);
+                const int32_t* go = tl_scratch.gate_out;
+                const int32_t* uo = tl_scratch.up_out;
+                __m512 vmax = _mm512_setzero_ps();
+                for (int h = 0; h < H; h += 16) {
+                    __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(go + h)), sg);
+                    __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(uo + h)), su);
+                    __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                    _mm512_storeu_ps(tl_scratch.gated_fp32 + h, value);
+                    vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+                }
+                max_abs = _mm512_reduce_max_ps(vmax);
+            }
+#else
+            for (int h = 0; h < H; ++h) {
+                const float gate = (float)tl_scratch.gate_out[h] * scale_g;
+                const float up = (float)tl_scratch.up_out[h] * scale_u;
+                const float value = (gate / (1.0f + expf(-gate))) * up;
+                tl_scratch.gated_fp32[h] = value;
+                max_abs = std::max(max_abs, fabsf(value));
+            }
+#endif
+            const float hidden_scale = quantize_hidden_row(
+                tl_scratch.gated_fp32, tl_scratch.quantized_gated, H, max_abs);
+
+            if (use_small_down) {
+                small_m_matmul_output_major(
+                    tl_scratch.quantized_gated, w_down_e, tl_scratch.down_out, 1, H, D);
+            } else {
+                matmul_packed(tl_scratch.quantized_gated, g_packed_down[e],
+                              tl_scratch.down_out, 1, H, D);
+            }
+
+            const float dequant = hidden_scale * g_scale_down[e];
+#if defined(__AVX512F__)
+            const __m512 dequant_vec = _mm512_set1_ps(dequant);
+            const __m512 weight_vec = _mm512_set1_ps(route_weight);
+            for (int d = 0; d < D; d += 16) {
+                const __m512i out_i32 = _mm512_loadu_si512(tl_scratch.down_out + d);
+                const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+                const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
+                const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
+                _mm512_storeu_ps(y_acc + d, contribution);
+            }
+#else
+            for (int d = 0; d < D; ++d)
+                y_acc[d] = route_weight * ((float)tl_scratch.down_out[d] * dequant);
+#endif
+        }
+    }
+    // 串行归约：y 已含 shared_expert(x) + 残差，叠加 K 个专家贡献。
+#if defined(__AVX512F__)
+    for (int k = 0; k < K; ++k) {
+        const float* yk = g_single_yacc[k];
+        for (int d = 0; d < D; d += 16) {
+            __m512 acc = _mm512_loadu_ps(y + d);
+            acc = _mm512_add_ps(acc, _mm512_loadu_ps(yk + d));
+            _mm512_storeu_ps(y + d, acc);
+        }
+    }
+#else
+    for (int k = 0; k < K; ++k)
+        for (int d = 0; d < D; ++d)
+            y[d] += g_single_yacc[k][d];
+#endif
+}
+#endif
+
 static void compute_single_token_routed_experts(
-    const MoEWeights& w, float* y, int D, int H, int K) {
+    const MoEWeights& w, float* y, int D, int H, int K, int nthreads) {
+#if defined(_OPENMP)
+    if (nthreads > 1 && K >= 2) {
+        compute_single_token_routed_experts_parallel(w, y, D, H, K, nthreads);
+        return;
+    }
+#else
+    (void)nthreads;
+#endif
     const int8_t* xq = g_quantized_x;
     const float x_scale = g_x_scale[0];
     const size_t expert_elems = (size_t)D * H;
@@ -1124,48 +1291,6 @@ static void compute_single_token_routed_experts(
 // 申请 XTILEDATA 权限，否则执行 TDPBSSD 会触发 SIGILL。
 // -----------------------------------------------------------------------------
 #if defined(_OPENMP)
-struct ExpertScratch {
-    int8_t*  A = nullptr;
-    int32_t* gate_out = nullptr;
-    int32_t* up_out = nullptr;
-    float*   gated_fp32 = nullptr;
-    int8_t*  quantized_gated = nullptr;
-    float*   gated_scale = nullptr;
-    int32_t* down_out = nullptr;
-    size_t   cap = 0;
-    bool     amx_perm = false;
-
-    static void* xalloc(size_t n) {
-        void* p = nullptr;
-        size_t sz = (n + 63) & ~((size_t)63);
-        if (posix_memalign(&p, 64, sz) != 0) return nullptr;
-        return p;
-    }
-    void ensure(size_t max_rows, size_t D, size_t H) {
-        size_t maxdim = (D > H) ? D : H;
-        size_t need = max_rows * maxdim;
-        if (need <= cap) return;
-        free_all();
-        A               = (int8_t*)  xalloc(need);
-        gate_out        = (int32_t*) xalloc(need * 4);
-        up_out          = (int32_t*) xalloc(need * 4);
-        gated_fp32      = (float*)   xalloc(need * 4);
-        quantized_gated = (int8_t*)  xalloc(need);
-        down_out        = (int32_t*) xalloc(need * 4);
-        gated_scale     = (float*)   xalloc(max_rows * 4);
-        cap = need;
-    }
-    void free_all() {
-        free(A); free(gate_out); free(up_out); free(gated_fp32);
-        free(quantized_gated); free(down_out); free(gated_scale);
-        A = nullptr; gate_out = nullptr; up_out = nullptr;
-        gated_fp32 = nullptr; quantized_gated = nullptr;
-        down_out = nullptr; gated_scale = nullptr;
-        cap = 0;
-    }
-    ~ExpertScratch() { free_all(); }
-};
-static thread_local ExpertScratch tl_scratch;
 
 static float* g_yacc_pool = nullptr;
 static size_t g_yacc_cap = 0;
@@ -1338,7 +1463,15 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     // N=1 不需要按专家聚拢：直接按 Top-K 顺序计算，跳过计数器、列表、
     // 16/512 专家全扫描以及输入 Gather。
     if (num_tokens == 1) {
-        compute_single_token_routed_experts(w, y, D, H, K);
+#if defined(_OPENMP)
+        int k_threads = K;
+        const int np = omp_get_num_procs();
+        if (k_threads > np) k_threads = np;
+        if (k_threads < 1) k_threads = 1;
+#else
+        const int k_threads = 1;
+#endif
+        compute_single_token_routed_experts(w, y, D, H, K, k_threads);
         return;
     }
 
