@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <immintrin.h>
 
 #if defined(_OPENMP)
@@ -1110,6 +1111,195 @@ static void compute_single_token_routed_experts(
     }
 }
 
+// -----------------------------------------------------------------------------
+// R5: 按专家并行的路由专家计算
+//
+// 串行专家循环是 S3/S4 的主要瓶颈。本路径将 for(e) 拆分到多线程：每个线程
+// 持有独立 GEMM scratch（A/gate_out/up_out/gated_fp32/quantized_gated/down_out）
+// 与独立输出累加缓冲 y_acc[th]，避免竞争全局 g_amx_A 等；专家处理完毕后在
+// 并行区内对所有 y_acc 切片求和并加回 y（y 已含共享专家输出与残差 x）。
+//
+// AMX Tile 配置 g_tile_cfg/g_last_tile_rows 已是 thread_local；但
+// arch_prctl(ARCH_REQ_XCOMP_PERM) 是每线程状态，工作线程首次进入时须单独
+// 申请 XTILEDATA 权限，否则执行 TDPBSSD 会触发 SIGILL。
+// -----------------------------------------------------------------------------
+#if defined(_OPENMP)
+struct ExpertScratch {
+    int8_t*  A = nullptr;
+    int32_t* gate_out = nullptr;
+    int32_t* up_out = nullptr;
+    float*   gated_fp32 = nullptr;
+    int8_t*  quantized_gated = nullptr;
+    float*   gated_scale = nullptr;
+    int32_t* down_out = nullptr;
+    size_t   cap = 0;
+    bool     amx_perm = false;
+
+    static void* xalloc(size_t n) {
+        void* p = nullptr;
+        size_t sz = (n + 63) & ~((size_t)63);
+        if (posix_memalign(&p, 64, sz) != 0) return nullptr;
+        return p;
+    }
+    void ensure(size_t max_rows, size_t D, size_t H) {
+        size_t maxdim = (D > H) ? D : H;
+        size_t need = max_rows * maxdim;
+        if (need <= cap) return;
+        free_all();
+        A               = (int8_t*)  xalloc(need);
+        gate_out        = (int32_t*) xalloc(need * 4);
+        up_out          = (int32_t*) xalloc(need * 4);
+        gated_fp32      = (float*)   xalloc(need * 4);
+        quantized_gated = (int8_t*)  xalloc(need);
+        down_out        = (int32_t*) xalloc(need * 4);
+        gated_scale     = (float*)   xalloc(max_rows * 4);
+        cap = need;
+    }
+    void free_all() {
+        free(A); free(gate_out); free(up_out); free(gated_fp32);
+        free(quantized_gated); free(down_out); free(gated_scale);
+        A = nullptr; gate_out = nullptr; up_out = nullptr;
+        gated_fp32 = nullptr; quantized_gated = nullptr;
+        down_out = nullptr; gated_scale = nullptr;
+        cap = 0;
+    }
+    ~ExpertScratch() { free_all(); }
+};
+static thread_local ExpertScratch tl_scratch;
+
+static float* g_yacc_pool = nullptr;
+static size_t g_yacc_cap = 0;
+static float* acquire_yacc_pool(size_t need_elems) {
+    if (need_elems > g_yacc_cap) {
+        free(g_yacc_pool);
+        g_yacc_pool = (float*)ExpertScratch::xalloc(need_elems * sizeof(float));
+        g_yacc_cap = need_elems;
+    }
+    return g_yacc_pool;
+}
+
+static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
+                                            int num_tokens, int D, int H,
+                                            int E, int nthreads) {
+    int max_count = 1;
+    for (int e = 0; e < E; ++e)
+        if (g_expert_token_count[e] > max_count)
+            max_count = g_expert_token_count[e];
+
+    const size_t ystride = (size_t)num_tokens * D;
+    float* yacc_pool = acquire_yacc_pool((size_t)nthreads * ystride);
+    const size_t expert_elems = (size_t)D * H;
+
+#pragma omp parallel num_threads(nthreads)
+    {
+        const int tid = omp_get_thread_num();
+
+        if (g_amx_runtime_enabled && !tl_scratch.amx_perm)
+            tl_scratch.amx_perm = request_amx_permission();
+        tl_scratch.ensure((size_t)max_count, (size_t)D, (size_t)H);
+
+        float* y_acc = yacc_pool + (size_t)tid * ystride;
+        std::memset(y_acc, 0, ystride * sizeof(float));
+
+#pragma omp for schedule(dynamic)
+        for (int e = 0; e < E; ++e) {
+            const int count = g_expert_token_count[e];
+            if (count == 0) continue;
+
+            int8_t* A = tl_scratch.A;
+            for (int i = 0; i < count; ++i) {
+                const int t = g_expert_token_list[e][i];
+                std::memcpy(A + (size_t)i * D,
+                            g_quantized_x + (size_t)t * D,
+                            (size_t)D * sizeof(int8_t));
+            }
+            const int8_t* w_gate_e = w.w_gate + (size_t)e * expert_elems;
+            const int8_t* w_up_e   = w.w_up   + (size_t)e * expert_elems;
+            const int8_t* w_down_e = w.w_down + (size_t)e * expert_elems;
+
+            matmul_gate_up(A, g_packed_gate[e], g_packed_up[e],
+                           w_gate_e, w_up_e,
+                           tl_scratch.gate_out, tl_scratch.up_out,
+                           count, D, H);
+
+            for (int i = 0; i < count; ++i) {
+                const int t = g_expert_token_list[e][i];
+                const float scale_g = g_scale_gate[e] * g_x_scale[t];
+                const float scale_u = g_scale_up[e]   * g_x_scale[t];
+                float* h_row  = tl_scratch.gated_fp32      + (size_t)i * H;
+                int8_t* hq_row = tl_scratch.quantized_gated + (size_t)i * H;
+                float max_abs = 0.0f;
+#if defined(__AVX512F__)
+                {
+                    const __m512 sg = _mm512_set1_ps(scale_g);
+                    const __m512 su = _mm512_set1_ps(scale_u);
+                    const int32_t* go = tl_scratch.gate_out + (size_t)i * H;
+                    const int32_t* uo = tl_scratch.up_out   + (size_t)i * H;
+                    __m512 vmax = _mm512_setzero_ps();
+                    for (int h = 0; h < H; h += 16) {
+                        __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(go + h)), sg);
+                        __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(uo + h)), su);
+                        __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                        _mm512_storeu_ps(h_row + h, value);
+                        vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+                    }
+                    max_abs = _mm512_reduce_max_ps(vmax);
+                }
+#else
+                for (int h = 0; h < H; ++h) {
+                    const float gate = (float)tl_scratch.gate_out[(size_t)i * H + h] * scale_g;
+                    const float up   = (float)tl_scratch.up_out[(size_t)i * H + h] * scale_u;
+                    const float value = (gate / (1.0f + expf(-gate))) * up;
+                    h_row[h] = value;
+                    max_abs = std::max(max_abs, fabsf(value));
+                }
+#endif
+                tl_scratch.gated_scale[i] =
+                    quantize_hidden_row(h_row, hq_row, H, max_abs);
+            }
+
+            matmul_small_m_or_packed(
+                tl_scratch.quantized_gated, g_packed_down[e], w_down_e,
+                tl_scratch.down_out, count, H, D);
+
+            for (int i = 0; i < count; ++i) {
+                const int t = g_expert_token_list[e][i];
+                const float route_weight = g_expert_token_weight[e][i];
+                const float dequant = tl_scratch.gated_scale[i] * g_scale_down[e];
+                float* y_t = y_acc + (size_t)t * D;
+                const int32_t* out_t = tl_scratch.down_out + (size_t)i * D;
+#if defined(__AVX512F__)
+                const __m512 dequant_vec = _mm512_set1_ps(dequant);
+                const __m512 weight_vec = _mm512_set1_ps(route_weight);
+                for (int d = 0; d < D; d += 16) {
+                    const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
+                    const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+                    const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
+                    const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
+                    const __m512 y_vec = _mm512_loadu_ps(y_t + d);
+                    _mm512_storeu_ps(y_t + d, _mm512_add_ps(y_vec, contribution));
+                }
+#else
+                for (int d = 0; d < D; ++d)
+                    y_t[d] += route_weight * ((float)out_t[d] * dequant);
+#endif
+            }
+        }
+
+#pragma omp for schedule(static)
+        for (size_t idx = 0; idx < ystride; ++idx) {
+            float s = 0.0f;
+            for (int th = 0; th < nthreads; ++th)
+                s += yacc_pool[(size_t)th * ystride + idx];
+            y[idx] += s;
+        }
+    }
+}
+#else
+static inline void compute_routed_experts_parallel(const MoEWeights&, float*,
+                                                   int, int, int, int, int) {}
+#endif
+
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
     const int D = w.d_model;
@@ -1124,9 +1314,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     //   N < 64  ：单线程（S1、S2）
     // omp_get_num_procs() 返回作业分配的 CPU 数（如 -c 16 → 16），
     // 不受之前 omp_set_num_threads() 调用影响。
+    int opt_threads = 1;
     {
         const int num_procs = omp_get_num_procs();
-        int opt_threads;
         if (num_tokens >= 512) {
             opt_threads = num_procs;
         } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
@@ -1136,6 +1326,8 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         }
         omp_set_num_threads(opt_threads);
     }
+#else
+    const int opt_threads = 1;
 #endif
 
     compute_routing(x, w, num_tokens, D, E, K);
@@ -1151,6 +1343,12 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     }
 
     dispatch_tokens_to_experts(num_tokens, E, K);
+
+    // 多 token 且多线程时按专家并行计算路由专家；否则走串行回退路径。
+    if (opt_threads > 1) {
+        compute_routed_experts_parallel(w, y, num_tokens, D, H, E, opt_threads);
+        return;
+    }
 
     for (int e = 0; e < E; ++e) {
         const int count = g_expert_token_count[e];
