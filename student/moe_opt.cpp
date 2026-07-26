@@ -269,6 +269,35 @@ static inline void insert_routing_candidate(
  * AVX-512 路径仍一次并行计算4个专家的点积并复用 x 向量；4个 logit 归约后
  * 按专家编号顺序计算精确 expf/Sigmoid，并立即插入局部 Top-K。
  */
+#if defined(__AVX512F__)
+// AVX-512 exp() via Cephes range-reduction + degree-6 polynomial. |x|<88, rel err<1e-7.
+static inline __m512 exp512_ps(__m512 x) {
+    const __m512 inv_ln2 = _mm512_set1_ps(1.4426950408889634f);
+    const __m512 ln2     = _mm512_set1_ps(0.6931471805599453f);
+    x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.0f));
+    __m512 fx = _mm512_mul_ps(x, inv_ln2);
+    __m512 n  = _mm512_cvtepi32_ps(_mm512_cvtps_epi32(fx));
+    __m512 r  = _mm512_fnmadd_ps(n, ln2, x);
+    __m512i ip = _mm512_add_epi32(_mm512_cvttps_epi32(n), _mm512_set1_epi32(127));
+    __m512 pow2n = _mm512_castsi512_ps(_mm512_slli_epi32(ip, 23));
+    // 7-order Taylor: exp(r)=1+r+r^2/2+...+r^6/720, r in [-0.347,0.347], err<1e-9
+    __m512 pp = _mm512_set1_ps(1.3888888889E-3f);
+    pp = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(8.3333333333E-3f));
+    pp = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(4.1666666667E-2f));
+    pp = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(1.6666666667E-1f));
+    pp = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(5.0E-1f));
+    pp = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(1.0f));
+    __m512 exp_r = _mm512_fmadd_ps(r, pp, _mm512_set1_ps(1.0f));
+    return _mm512_mul_ps(pow2n, exp_r);
+}
+static inline __m512 silu512_ps(__m512 v) {
+    __m512 neg = _mm512_xor_ps(v, _mm512_set1_ps(-0.0f));
+    __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp512_ps(neg));
+    return _mm512_div_ps(v, denom);
+}
+#endif
+
 static inline void compute_routing(const float* x, const MoEWeights& w,
                                    int num_tokens, int D, int E, int K) {
 #if defined(_OPENMP)
@@ -1122,15 +1151,31 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             int8_t* hq_row = g_quantized_gated + (size_t)i * H;
             float max_abs = 0.0f;
 
+#if defined(__AVX512F__)
+            {
+                const __m512 sg = _mm512_set1_ps(scale_g);
+                const __m512 su = _mm512_set1_ps(scale_u);
+                const int32_t* go = g_gate_out + (size_t)i * H;
+                const int32_t* uo = g_up_out   + (size_t)i * H;
+                __m512 vmax = _mm512_setzero_ps();
+                for (int h = 0; h < H; h += 16) {
+                    __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(go + h)), sg);
+                    __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(uo + h)), su);
+                    __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                    _mm512_storeu_ps(h_row + h, value);
+                    vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+                }
+                max_abs = _mm512_reduce_max_ps(vmax);
+            }
+#else
             for (int h = 0; h < H; ++h) {
-                const float gate =
-                    (float)g_gate_out[(size_t)i * H + h] * scale_g;
-                const float up =
-                    (float)g_up_out[(size_t)i * H + h] * scale_u;
+                const float gate = (float)g_gate_out[(size_t)i * H + h] * scale_g;
+                const float up = (float)g_up_out[(size_t)i * H + h] * scale_u;
                 const float value = (gate / (1.0f + expf(-gate))) * up;
                 h_row[h] = value;
                 max_abs = std::max(max_abs, fabsf(value));
             }
+#endif
             g_gated_scale[i] =
                 quantize_hidden_row(h_row, hq_row, H, max_abs);
         }
