@@ -1551,34 +1551,51 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
         int cand_idx[N_CAND];
         float cand_affinity[N_CAND];
         float cand_score[N_CAND];
+        // R20: track top-N_CAND via a running minimum instead of a per-expert
+        // sorted insert. Each expert needs only 1 compare (recompute the min of
+        // the N_CAND only when a new candidate enters) -> ~7x fewer comparisons
+        // and no shifts. VTune showed Step-2 candidate insertion was 22.8% of S4
+        // CPU time (branchy sorted insert over 512 experts/token). The candidate
+        // SET is identical to before (just unordered); Step-3 refinement is
+        // order-independent, so correctness is preserved.
+        float min_score = -1e30f;
+        int min_pos = 0;
         for (int i = 0; i < N_CAND; ++i) {
             cand_idx[i] = -1;
             cand_affinity[i] = 0.0f;
-            cand_score[i] = 0.0f;
+            cand_score[i] = -1e30f;
         }
 
 #if defined(__AVX512F__)
         const __m512 xs_vec = _mm512_set1_ps(x_scale);
         for (int e = 0; e < E; e += 16) {
-            // Load 16 INT32 logits -> FP32
             __m512 logits_v = _mm512_cvtepi32_ps(
                 _mm512_loadu_si512(logits_i32 + e));
-            // Dequantize: logit = int32 * x_scale * scale_router[e]
             logits_v = _mm512_mul_ps(logits_v, xs_vec);
             logits_v = _mm512_mul_ps(logits_v, _mm512_loadu_ps(g_scale_router + e));
-            // Vectorized sigmoid via exp512_ps
             __m512 neg_v = _mm512_xor_ps(logits_v, _mm512_set1_ps(-0.0f));
             __m512 exp_v = exp512_ps(neg_v);
             __m512 one_v = _mm512_set1_ps(1.0f);
             __m512 aff_v = _mm512_div_ps(one_v, _mm512_add_ps(one_v, exp_v));
             __m512 score_v = _mm512_add_ps(aff_v, _mm512_loadu_ps(w.bias + e));
-            // Extract and insert into top-N_CAND
             float aff_arr[16], score_arr[16];
             _mm512_storeu_ps(aff_arr, aff_v);
             _mm512_storeu_ps(score_arr, score_v);
             for (int j = 0; j < 16; ++j) {
-                insert_routing_candidate(e + j, aff_arr[j], score_arr[j], N_CAND,
-                                        cand_idx, cand_affinity, cand_score);
+                const float s = score_arr[j];
+                if (s > min_score) {
+                    const int p = min_pos;
+                    cand_idx[p] = e + j;
+                    cand_affinity[p] = aff_arr[j];
+                    cand_score[p] = s;
+                    min_pos = 0;
+                    min_score = cand_score[0];
+                    for (int m = 1; m < N_CAND; ++m)
+                        if (cand_score[m] < min_score) {
+                            min_score = cand_score[m];
+                            min_pos = m;
+                        }
+                }
             }
         }
 #else
