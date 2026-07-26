@@ -1639,7 +1639,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     {
         const int num_procs = omp_get_num_procs();
         if (num_tokens >= 512) {
-            opt_threads = num_procs;
+            opt_threads = (num_procs < 8) ? num_procs : 8;
         } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
             opt_threads = (num_procs < 8) ? num_procs : 8;
         } else {
