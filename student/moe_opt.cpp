@@ -931,15 +931,31 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
         float max_abs = 0.0f;
 
         // 生成 SwiGLU hidden 的同时统计 max_abs，避免量化函数再次扫描一遍。
+#if defined(__AVX512F__)
+        {
+            const __m512 sg = _mm512_set1_ps(scale_g);
+            const __m512 su = _mm512_set1_ps(scale_u);
+            const int32_t* go = g_shared_gate_out + (size_t)t * H;
+            const int32_t* uo = g_shared_up_out   + (size_t)t * H;
+            __m512 vmax = _mm512_setzero_ps();
+            for (int h = 0; h < H; h += 16) {
+                __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(go + h)), sg);
+                __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(uo + h)), su);
+                __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                _mm512_storeu_ps(h_row + h, value);
+                vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+            }
+            max_abs = _mm512_reduce_max_ps(vmax);
+        }
+#else
         for (int h = 0; h < H; ++h) {
-            const float gate =
-                (float)g_shared_gate_out[(size_t)t * H + h] * scale_g;
-            const float up =
-                (float)g_shared_up_out[(size_t)t * H + h] * scale_u;
+            const float gate = (float)g_shared_gate_out[(size_t)t * H + h] * scale_g;
+            const float up = (float)g_shared_up_out[(size_t)t * H + h] * scale_u;
             const float value = (gate / (1.0f + expf(-gate))) * up;
             h_row[h] = value;
             max_abs = std::max(max_abs, fabsf(value));
         }
+#endif
         g_shared_gated_scale[t] =
             quantize_hidden_row(h_row, hq_row, H, max_abs);
     }
@@ -1036,6 +1052,21 @@ static void compute_single_token_routed_experts(
         const float scale_g = g_scale_gate[e] * x_scale;
         const float scale_u = g_scale_up[e] * x_scale;
         float max_abs = 0.0f;
+#if defined(__AVX512F__)
+        {
+            const __m512 sg = _mm512_set1_ps(scale_g);
+            const __m512 su = _mm512_set1_ps(scale_u);
+            __m512 vmax = _mm512_setzero_ps();
+            for (int h = 0; h < H; h += 16) {
+                __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(g_gate_out + h)), sg);
+                __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(g_up_out + h)), su);
+                __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                _mm512_storeu_ps(g_gated_fp32 + h, value);
+                vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+            }
+            max_abs = _mm512_reduce_max_ps(vmax);
+        }
+#else
         for (int h = 0; h < H; ++h) {
             const float gate = (float)g_gate_out[h] * scale_g;
             const float up = (float)g_up_out[h] * scale_u;
@@ -1043,6 +1074,7 @@ static void compute_single_token_routed_experts(
             g_gated_fp32[h] = value;
             max_abs = std::max(max_abs, fabsf(value));
         }
+#endif
         const float hidden_scale = quantize_hidden_row(
             g_gated_fp32, g_quantized_gated, H, max_abs);
 
