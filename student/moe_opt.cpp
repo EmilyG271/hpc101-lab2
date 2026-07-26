@@ -307,9 +307,9 @@ static inline void compute_logits(const float* x, const MoEWeights& w,
  * 功能：先计算 s[t,e] = sigmoid(g_logits[t,e])，再依据 s[t,e] + bias[e]
  * 选择 K 个专家。偏置只影响专家选择，绝不能进入后续路由权重归一化。
  *
- * 实现思路：每个 token 使用 used[] 标记已选专家，进行 K 轮顺序扫描。
- * 比较条件只使用严格大于，因此当两个分数完全相同时，较小的专家编号会先被
- * 扫描并保留，与标量参考实现的 tie-break 规则一致。
+ * 实现思路：K=2 时一次扫描同时维护前两名；其他 K 使用 used[] 逐轮选择。
+ * 两条路径均按专家编号递增扫描且只在严格大于时替换，因此同分时小索引优先，
+ * 与标量参考实现的 tie-break 规则一致。
  *
  * 向量化情况：未显式向量化。Sigmoid 依赖 expf，Top-K 又包含数据相关分支，
  * 当前保持标量实现以优先保证选择语义与参考版本一致。
@@ -327,21 +327,43 @@ static inline void compute_affinity_and_topk(const MoEWeights& w,
             g_affinity[t][e] = 1.0f / (1.0f + expf(-z));
         }
 
-        // Match the reference tie rule: for equal biased scores, the smaller
-        // expert index wins because experts are scanned in increasing order.
-        bool used[MAX_NUM_EXPERTS] = {};
-        for (int k = 0; k < K; ++k) {
-            int best = -1;
+        // K=2 是 S4 的固定热点：一次扫描同时维护第一、第二名。
+        // 按专家编号递增扫描且只在严格大于时替换，因此同分时仍是小索引优先。
+        if (K == 2) {
+            int best0 = -1;
+            int best1 = -1;
+            float score0 = 0.0f;
+            float score1 = 0.0f;
             for (int e = 0; e < E; ++e) {
-                if (used[e]) continue;
-                if (best < 0 ||
-                    g_affinity[t][e] + w.bias[e] >
-                        g_affinity[t][best] + w.bias[best]) {
-                    best = e;
+                const float score = g_affinity[t][e] + w.bias[e];
+                if (best0 < 0 || score > score0) {
+                    best1 = best0;
+                    score1 = score0;
+                    best0 = e;
+                    score0 = score;
+                } else if (best1 < 0 || score > score1) {
+                    best1 = e;
+                    score1 = score;
                 }
             }
-            used[best] = true;
-            g_topk_indices[t][k] = best;
+            g_topk_indices[t][0] = best0;
+            g_topk_indices[t][1] = best1;
+        } else {
+            // 通用 K 路径与参考实现一致：逐轮选择，严格大于保证小索引优先。
+            bool used[MAX_NUM_EXPERTS] = {};
+            for (int k = 0; k < K; ++k) {
+                int best = -1;
+                for (int e = 0; e < E; ++e) {
+                    if (used[e]) continue;
+                    if (best < 0 ||
+                        g_affinity[t][e] + w.bias[e] >
+                            g_affinity[t][best] + w.bias[best]) {
+                        best = e;
+                    }
+                }
+                used[best] = true;
+                g_topk_indices[t][k] = best;
+            }
         }
     }
 }
@@ -529,6 +551,16 @@ static inline float quantize_hidden_row(const float* src, int8_t* dst,
 // -----------------------------------------------------------------------------
 
 static constexpr int SMALL_M_THRESHOLD = 4;
+// 仅在每行计算量足够大时启用 AVX-512BW 小 M kernel；避免 S1/S4 中
+// 矩阵较小时，符号扩展与水平归约开销超过欠填充 AMX 的成本。
+static constexpr size_t SMALL_M_WORK_THRESHOLD = 262144;
+// 当前实测融合 Gate/Up AMX 在 S3/S4 略慢，保留实现但暂时关闭。
+static constexpr bool USE_FUSED_GATE_UP_AMX = false;
+
+static inline bool should_use_small_m_kernel(int M, int K, int N) {
+    return M <= SMALL_M_THRESHOLD &&
+           (size_t)K * (size_t)N >= SMALL_M_WORK_THRESHOLD;
+}
 
 static void small_m_gate_up_output_major(
     const int8_t* A, const int8_t* W_gate, const int8_t* W_up,
@@ -838,36 +870,37 @@ static void matmul_packed(const int8_t* A, const int8_t* B_pack, int32_t* C,
     scalar_matmul_packed(A, B_pack, C, M, K, N);
 }
 
-// Gate/Up 统一分派：小 M 使用输出通道优先 AVX-512BW kernel；其余情况优先
-// 使用融合 AMX kernel。无 AMX 时仍可用原打包布局的标量实现验证正确性。
+// Gate/Up 统一分派：仅当 M<=4 且 K×N 足够大时使用 AVX-512BW 小 M
+// kernel；其余情况使用实测更快的分离 Gate/Up AMX。融合实现保留供后续 A/B。
 static void matmul_gate_up(
     const int8_t* A,
     const int8_t* B_gate_pack, const int8_t* B_up_pack,
     const int8_t* W_gate, const int8_t* W_up,
     int32_t* C_gate, int32_t* C_up,
     int M, int K, int N) {
-    if (M <= SMALL_M_THRESHOLD) {
+    if (should_use_small_m_kernel(M, K, N)) {
         small_m_gate_up_output_major(
             A, W_gate, W_up, C_gate, C_up, M, K, N);
         return;
     }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
-    if (g_amx_runtime_enabled) {
+    if (USE_FUSED_GATE_UP_AMX && g_amx_runtime_enabled) {
         amx_matmul_gate_up_packed(
             A, B_gate_pack, B_up_pack, C_gate, C_up, M, K, N);
         return;
     }
 #endif
-    scalar_matmul_packed(A, B_gate_pack, C_gate, M, K, N);
-    scalar_matmul_packed(A, B_up_pack, C_up, M, K, N);
+    // 实测分离 Gate/Up 在 S3/S4 更快；matmul_packed 会自行选择 AMX/标量。
+    matmul_packed(A, B_gate_pack, C_gate, M, K, N);
+    matmul_packed(A, B_up_pack, C_up, M, K, N);
 }
 
-// Down/普通单矩阵分派：M<=4 时读取连续的原始 W[N,K]，避免欠填充 AMX；
-// 较大 M 保持打包 AMX 路径。
+// Down/普通单矩阵分派：M<=4 且 K×N 达到阈值时读取原始 W[N,K]；
+// 否则保持打包 AMX 路径。
 static void matmul_small_m_or_packed(
     const int8_t* A, const int8_t* B_pack, const int8_t* W,
     int32_t* C, int M, int K, int N) {
-    if (M <= SMALL_M_THRESHOLD) {
+    if (should_use_small_m_kernel(M, K, N)) {
         small_m_matmul_output_major(A, W, C, M, K, N);
         return;
     }
@@ -885,7 +918,7 @@ static void matmul_small_m_or_packed(
  * 量化、Down 投影和反量化累加。共享专家路由权重固定为 1。
  *
  * 实现思路：
- * 1. M<=4 时使用 AVX-512BW 小矩阵 kernel，否则融合 Gate/Up AMX GEMM；
+ * 1. M<=4 且 K×N 足够大时使用 AVX-512BW；否则分离执行 Gate/Up AMX；
  * 2. 使用输入 scale 与权重 scale 将 INT32 投影反量化为 FP32；
  * 3. 计算 SiLU(gate)*up，并逐 token 重新量化为 INT8；
  * 4. 批量执行 INT8 Down GEMM；
@@ -893,8 +926,8 @@ static void matmul_small_m_or_packed(
  * 所有矩阵缓冲区均使用运行时 D/H 的紧凑行跨度，避免 MAX_* 二维数组造成
  * 的物理 stride 错误。
  *
- * 向量化情况：大 M 的 Gate/Up 使用融合 AMX，Down 使用普通 AMX；M<=4 时
- * 使用 AVX-512BW 专用路径。hidden 重量化和 Down 反量化使用 AVX-512。
+ * 向量化情况：常规 Gate/Up/Down 使用 AMX；仅对计算量足够大的小 M 使用
+ * AVX-512BW 专用路径。hidden 重量化和 Down 反量化使用 AVX-512。
  */
 static void compute_shared_expert(const MoEWeights& w, float* y,
                                   int num_tokens, int D, int H) {
