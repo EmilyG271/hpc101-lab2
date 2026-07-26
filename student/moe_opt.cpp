@@ -13,6 +13,10 @@
 #include <cstring>
 #include <immintrin.h>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__) && defined(__linux__)
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -1051,6 +1055,27 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int H = w.d_ff;
     const int E = w.num_experts;
     const int K = w.top_k;
+
+#if defined(_OPENMP)
+    // 根据批大小动态选择线程数，使各场景自动达到最优：
+    //   N >= 512：使用全部可用核心（S4：16线程）
+    //   N >= 64 ：限制为 8 线程（S3 实测最优）
+    //   N < 64  ：单线程（S1、S2）
+    // omp_get_num_procs() 返回作业分配的 CPU 数（如 -c 16 → 16），
+    // 不受之前 omp_set_num_threads() 调用影响。
+    {
+        const int num_procs = omp_get_num_procs();
+        int opt_threads;
+        if (num_tokens >= 512) {
+            opt_threads = num_procs;
+        } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
+            opt_threads = (num_procs < 8) ? num_procs : 8;
+        } else {
+            opt_threads = 1;
+        }
+        omp_set_num_threads(opt_threads);
+    }
+#endif
 
     compute_routing(x, w, num_tokens, D, E, K);
     quantize_input(x, num_tokens, D);
