@@ -646,7 +646,7 @@ static constexpr int SMALL_M_THRESHOLD = 4;
 // 矩阵较小时，符号扩展与水平归约开销超过欠填充 AMX 的成本。
 static constexpr size_t SMALL_M_WORK_THRESHOLD = 262144;
 // 当前实测融合 Gate/Up AMX 在 S3/S4 略慢，保留实现但暂时关闭。
-static constexpr bool USE_FUSED_GATE_UP_AMX = false;
+static constexpr bool USE_FUSED_GATE_UP_AMX = true;
 
 static inline bool should_use_small_m_kernel(int M, int K, int N) {
     return M <= SMALL_M_THRESHOLD &&
@@ -975,7 +975,7 @@ static void matmul_gate_up(
         return;
     }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
-    if (USE_FUSED_GATE_UP_AMX && g_amx_runtime_enabled) {
+    if (USE_FUSED_GATE_UP_AMX && g_amx_runtime_enabled && M <= 16) {
         amx_matmul_gate_up_packed(
             A, B_gate_pack, B_up_pack, C_gate, C_up, M, K, N);
         return;
@@ -1527,7 +1527,7 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
 #endif
 
     // Step 2: Vectorized dequantize + sigmoid + top-16 candidate selection
-    constexpr int N_CAND = 16;
+    constexpr int N_CAND = 8;
 #pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
     for (int t = 0; t < num_tokens; ++t) {
         const float x_scale = g_x_scale[t];
