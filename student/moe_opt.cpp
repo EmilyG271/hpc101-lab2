@@ -307,8 +307,8 @@ static inline void compute_logits(const float* x, const MoEWeights& w,
  * 功能：先计算 s[t,e] = sigmoid(g_logits[t,e])，再依据 s[t,e] + bias[e]
  * 选择 K 个专家。偏置只影响专家选择，绝不能进入后续路由权重归一化。
  *
- * 实现思路：K=2 时一次扫描同时维护前两名；其他 K 使用 used[] 逐轮选择。
- * 两条路径均按专家编号递增扫描且只在严格大于时替换，因此同分时小索引优先，
+ * 实现思路：K=2 一次扫描维护前两名，K=4 一次扫描维护有序前四名；
+ * 其他 K 使用 used[] 逐轮选择。所有路径严格大于才替换，同分时小索引优先，
  * 与标量参考实现的 tie-break 规则一致。
  *
  * 向量化情况：未显式向量化。Sigmoid 依赖 expf，Top-K 又包含数据相关分支，
@@ -348,6 +348,32 @@ static inline void compute_affinity_and_topk(const MoEWeights& w,
             }
             g_topk_indices[t][0] = best0;
             g_topk_indices[t][1] = best1;
+        } else if (K == 4) {
+            // S1/S3 的 Top-4 一次扫描插入排序，避免 4 次完整专家扫描以及
+            // used[MAX_NUM_EXPERTS] 的大数组清零。
+            int best_idx[4] = {-1, -1, -1, -1};
+            float best_score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int e = 0; e < E; ++e) {
+                const float score = g_affinity[t][e] + w.bias[e];
+                int pos = 4;
+                for (int j = 0; j < 4; ++j) {
+                    if (best_idx[j] < 0 || score > best_score[j]) {
+                        pos = j;
+                        break;
+                    }
+                }
+                if (pos < 4) {
+                    for (int j = 3; j > pos; --j) {
+                        best_idx[j] = best_idx[j - 1];
+                        best_score[j] = best_score[j - 1];
+                    }
+                    best_idx[pos] = e;
+                    best_score[pos] = score;
+                }
+            }
+            for (int k = 0; k < 4; ++k) {
+                g_topk_indices[t][k] = best_idx[k];
+            }
         } else {
             // 通用 K 路径与参考实现一致：逐轮选择，严格大于保证小索引优先。
             bool used[MAX_NUM_EXPERTS] = {};
@@ -996,9 +1022,9 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
  * 实现思路：
  * 1. memcpy 初始化残差 y=x；
  * 2. 计算 Router logit、Sigmoid、带 bias 的 Top-K 和无 bias 路由权重；
- * 3. 输入按 token 量化一次，共享专家与路由专家复用 x_q/s_x；
- * 4. 先批量计算共享专家；
- * 5. 按专家遍历，将该专家命中的 token Gather 到紧凑 g_amx_A；
+ * 3. 输入按 token 量化一次，并先计算共享专家；
+ * 4. N=1 时直接按 Top-K 计算路由专家并返回；
+ * 5. N>1 时按专家分发并将命中 token Gather 到紧凑 g_amx_A；
  * 6. 对聚拢后的 token 批量执行 Gate/Up AMX GEMM、SwiGLU 和隐藏重量化；
  * 7. 执行 Down AMX GEMM，再按对应路由权重反量化并累加到原 token 输出。
  *
@@ -1013,6 +1039,83 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
  * @param y          FP32 输出，布局 [num_tokens,D]。
  * @param num_tokens 当前批次 token 数量。
  */
+/**
+ * @brief 单 Token 路由专家快速路径。
+ *
+ * N=1 时无需构建专家计数/列表，也无需扫描全部 E 个专家或复制到 g_amx_A。
+ * 直接按 Top-K 排名顺序计算被选中的专家；S1 直接调用分离 AMX，S2 仍保留
+ * K×N 达阈值时的 AVX-512BW 小 M kernel。
+ */
+static void compute_single_token_routed_experts(
+    const MoEWeights& w, float* y, int D, int H, int K) {
+    const int8_t* xq = g_quantized_x;
+    const float x_scale = g_x_scale[0];
+    const size_t expert_elems = (size_t)D * H;
+    const bool use_small_gate_up = should_use_small_m_kernel(1, D, H);
+    const bool use_small_down = should_use_small_m_kernel(1, H, D);
+
+    for (int k = 0; k < K; ++k) {
+        const int e = g_topk_indices[0][k];
+        const float route_weight = g_topk_weights[0][k];
+        const int8_t* w_gate_e = w.w_gate + (size_t)e * expert_elems;
+        const int8_t* w_up_e = w.w_up + (size_t)e * expert_elems;
+        const int8_t* w_down_e = w.w_down + (size_t)e * expert_elems;
+
+        if (use_small_gate_up) {
+            small_m_gate_up_output_major(
+                xq, w_gate_e, w_up_e,
+                g_gate_out, g_up_out, 1, D, H);
+        } else {
+            // S1 直接进入分离 AMX/标量打包 kernel，跳过通用分派判断。
+            matmul_packed(xq, g_packed_gate[e], g_gate_out, 1, D, H);
+            matmul_packed(xq, g_packed_up[e], g_up_out, 1, D, H);
+        }
+
+        const float scale_g = g_scale_gate[e] * x_scale;
+        const float scale_u = g_scale_up[e] * x_scale;
+        float max_abs = 0.0f;
+        for (int h = 0; h < H; ++h) {
+            const float gate = (float)g_gate_out[h] * scale_g;
+            const float up = (float)g_up_out[h] * scale_u;
+            const float value = (gate / (1.0f + expf(-gate))) * up;
+            g_gated_fp32[h] = value;
+            max_abs = std::max(max_abs, fabsf(value));
+        }
+        const float hidden_scale = quantize_hidden_row(
+            g_gated_fp32, g_quantized_gated, H, max_abs);
+
+        if (use_small_down) {
+            small_m_matmul_output_major(
+                g_quantized_gated, w_down_e, g_down_out, 1, H, D);
+        } else {
+            matmul_packed(
+                g_quantized_gated, g_packed_down[e],
+                g_down_out, 1, H, D);
+        }
+
+        const float dequant = hidden_scale * g_scale_down[e];
+#if defined(__AVX512F__)
+        const __m512 dequant_vec = _mm512_set1_ps(dequant);
+        const __m512 weight_vec = _mm512_set1_ps(route_weight);
+        for (int d = 0; d < D; d += 16) {
+            const __m512i out_i32 = _mm512_loadu_si512(g_down_out + d);
+            const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+            const __m512 dequantized =
+                _mm512_mul_ps(out_fp32, dequant_vec);
+            const __m512 contribution =
+                _mm512_mul_ps(weight_vec, dequantized);
+            const __m512 y_vec = _mm512_loadu_ps(y + d);
+            _mm512_storeu_ps(
+                y + d, _mm512_add_ps(y_vec, contribution));
+        }
+#else
+        for (int d = 0; d < D; ++d) {
+            y[d] += route_weight * ((float)g_down_out[d] * dequant);
+        }
+#endif
+    }
+}
+
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
     const int D = w.d_model;
@@ -1025,10 +1128,18 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     compute_logits(x, w, num_tokens, D, E);
     compute_affinity_and_topk(w, num_tokens, E, K);
     compute_topk_weights(num_tokens, K);
-    dispatch_tokens_to_experts(num_tokens, E, K);
     quantize_input(x, num_tokens, D);
 
     compute_shared_expert(w, y, num_tokens, D, H);
+
+    // N=1 不需要按专家聚拢：直接按 Top-K 顺序计算，跳过计数器、列表、
+    // 16/512 专家全扫描以及输入 Gather。
+    if (num_tokens == 1) {
+        compute_single_token_routed_experts(w, y, D, H, K);
+        return;
+    }
+
+    dispatch_tokens_to_experts(num_tokens, E, K);
 
     for (int e = 0; e < E; ++e) {
         const int count = g_expert_token_count[e];
