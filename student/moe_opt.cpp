@@ -104,6 +104,12 @@ static float g_scale_shared_down;
 // R10: Router 权重 FP16 存储（带宽降 2x，cvt 后 FP32 计算精度无损）
 alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
 
+// R12c: INT8 router weights for AMX GEMM (large-E path)
+alignas(64) static int8_t g_router_int8[MAX_NUM_EXPERTS * MAX_D_MODEL];
+alignas(64) static int8_t g_packed_router[MAX_D_MODEL * MAX_NUM_EXPERTS];
+static float g_scale_router[MAX_NUM_EXPERTS];
+alignas(64) static int32_t g_router_logits[MAX_NUM_TOKENS * MAX_NUM_EXPERTS];
+
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
 alignas(64) static thread_local unsigned char g_tile_cfg[64];
 // Tile 配置属于线程的扩展寄存器状态；缓存当前行数可跳过重复 LDTILECFG。
@@ -280,6 +286,51 @@ void preprocess(MoEWeights& w) {
             _mm256_storeu_si256(wf + d / 16, h);
         }
     }
+
+    // R12c: INT8 router weights for AMX GEMM (large-E path)
+    for (int e = 0; e < E; ++e) {
+        const float* rw = w.w_router + (size_t)e * D;
+        float max_abs = 0.0f;
+#if defined(__AVX512F__)
+        {
+            __m512 vmax = _mm512_setzero_ps();
+            for (int d = 0; d < D; d += 16) {
+                __m512 v = _mm512_loadu_ps(rw + d);
+                v = _mm512_andnot_ps(_mm512_set1_ps(-0.0f), v);
+                vmax = _mm512_max_ps(vmax, v);
+            }
+            max_abs = _mm512_reduce_max_ps(vmax);
+        }
+#else
+        for (int d = 0; d < D; ++d)
+            max_abs = std::max(max_abs, fabsf(rw[d]));
+#endif
+        g_scale_router[e] = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        const float inv_scale = 1.0f / g_scale_router[e];
+        int8_t* ri = g_router_int8 + (size_t)e * D;
+#if defined(__AVX512F__)
+        {
+            const __m512 inv_s = _mm512_set1_ps(inv_scale);
+            const __m512 lo = _mm512_set1_ps(-127.0f);
+            const __m512 hi = _mm512_set1_ps(127.0f);
+            for (int d = 0; d < D; d += 16) {
+                __m512 v = _mm512_mul_ps(_mm512_loadu_ps(rw + d), inv_s);
+                v = _mm512_roundscale_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                v = _mm512_min_ps(hi, _mm512_max_ps(lo, v));
+                const __m512i vi = _mm512_cvtps_epi32(v);
+                const __m128i v8 = _mm512_cvtepi32_epi8(vi);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(ri + d), v8);
+            }
+        }
+#else
+        for (int d = 0; d < D; ++d) {
+            long q = lrintf(rw[d] * inv_scale);
+            q = std::max(-127L, std::min(127L, q));
+            ri[d] = (int8_t)q;
+        }
+#endif
+    }
+    pack_output_major_weight(g_router_int8, g_packed_router, D, E);
 
     g_amx_runtime_enabled = request_amx_permission();
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -1436,6 +1487,140 @@ static inline void compute_routed_experts_parallel(const MoEWeights&, float*,
                                                    int, int, int, int, int) {}
 #endif
 
+// R12c: INT8 AMX router with vectorized FP16 refinement for large E.
+// Uses AMX TDPBSSD to compute approximate INT32 logits, then vectorized
+// sigmoid (exp512_ps, 16 at a time) for candidate selection, and FP16
+// refinement of top-16 candidates for precision.
+static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
+                                      int num_tokens, int D, int E, int K) {
+    constexpr int TILE_M = 16;
+    constexpr int TILE_K = 64;
+    constexpr int TILE_N = 16;
+
+    // Step 1: AMX INT8 GEMM: logits_int32[N, E] = quantized_x[N, D] * router_int8[D, E]
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    {
+        static thread_local bool router_amx_perm = false;
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+        for (int t0 = 0; t0 < num_tokens; t0 += TILE_M) {
+            if (!router_amx_perm) {
+                router_amx_perm = request_amx_permission();
+            }
+            const int rows_m = std::min(TILE_M, num_tokens - t0);
+            configure_amx_tiles(rows_m);
+            const int8_t* A = g_quantized_x + (size_t)t0 * D;
+            int32_t* C = g_router_logits + (size_t)t0 * E;
+            for (int n0 = 0; n0 < E; n0 += TILE_N) {
+                _tile_zero(0);
+                for (int k0 = 0; k0 < D; k0 += TILE_K) {
+                    _tile_loadd(2, A + k0, D);
+                    _tile_loadd(3, g_packed_router + (size_t)(k0 / 4) * (E * 4) + n0 * 4, E * 4);
+                    _tile_dpbssd(0, 2, 3);
+                }
+                _tile_stored(0, C + n0, E * 4);
+            }
+        }
+    }
+#else
+    compute_routing(x, w, num_tokens, D, E, K);
+    return;
+#endif
+
+    // Step 2: Vectorized dequantize + sigmoid + top-16 candidate selection
+    constexpr int N_CAND = 16;
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float x_scale = g_x_scale[t];
+        const float* x_t = x + (size_t)t * D;
+        const int32_t* logits_i32 = g_router_logits + (size_t)t * E;
+
+        int cand_idx[N_CAND];
+        float cand_affinity[N_CAND];
+        float cand_score[N_CAND];
+        for (int i = 0; i < N_CAND; ++i) {
+            cand_idx[i] = -1;
+            cand_affinity[i] = 0.0f;
+            cand_score[i] = 0.0f;
+        }
+
+#if defined(__AVX512F__)
+        const __m512 xs_vec = _mm512_set1_ps(x_scale);
+        for (int e = 0; e < E; e += 16) {
+            // Load 16 INT32 logits -> FP32
+            __m512 logits_v = _mm512_cvtepi32_ps(
+                _mm512_loadu_si512(logits_i32 + e));
+            // Dequantize: logit = int32 * x_scale * scale_router[e]
+            logits_v = _mm512_mul_ps(logits_v, xs_vec);
+            logits_v = _mm512_mul_ps(logits_v, _mm512_loadu_ps(g_scale_router + e));
+            // Vectorized sigmoid via exp512_ps
+            __m512 neg_v = _mm512_xor_ps(logits_v, _mm512_set1_ps(-0.0f));
+            __m512 exp_v = exp512_ps(neg_v);
+            __m512 one_v = _mm512_set1_ps(1.0f);
+            __m512 aff_v = _mm512_div_ps(one_v, _mm512_add_ps(one_v, exp_v));
+            __m512 score_v = _mm512_add_ps(aff_v, _mm512_loadu_ps(w.bias + e));
+            // Extract and insert into top-N_CAND
+            float aff_arr[16], score_arr[16];
+            _mm512_storeu_ps(aff_arr, aff_v);
+            _mm512_storeu_ps(score_arr, score_v);
+            for (int j = 0; j < 16; ++j) {
+                insert_routing_candidate(e + j, aff_arr[j], score_arr[j], N_CAND,
+                                        cand_idx, cand_affinity, cand_score);
+            }
+        }
+#else
+        for (int e = 0; e < E; ++e) {
+            const float logit = (float)logits_i32[e] * x_scale * g_scale_router[e];
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(e, affinity, affinity + w.bias[e], N_CAND,
+                                    cand_idx, cand_affinity, cand_score);
+        }
+#endif
+
+        // Step 3: Refine top-N_CAND candidates with exact FP16 dot products
+        int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
+        float best_affinity[MAX_TOP_K] = {};
+        float best_score[MAX_TOP_K] = {};
+
+#if defined(__AVX512F__)
+        for (int c = 0; c < N_CAND; ++c) {
+            if (cand_idx[c] < 0) break;
+            const int e = cand_idx[c];
+            const __m256i* r_e = reinterpret_cast<const __m256i*>(
+                g_router_f16 + (size_t)e * D);
+            __m512 acc = _mm512_setzero_ps();
+            for (int d = 0; d < D; d += 16) {
+                const __m512 xv = _mm512_loadu_ps(x_t + d);
+                acc = _mm512_fmadd_ps(xv,
+                    _mm512_cvtph_ps(_mm256_loadu_si256(r_e + d / 16)), acc);
+            }
+            const float logit = _mm512_reduce_add_ps(acc);
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(e, affinity, affinity + w.bias[e], K,
+                                    best_idx, best_affinity, best_score);
+        }
+#else
+        for (int c = 0; c < N_CAND; ++c) {
+            if (cand_idx[c] < 0) break;
+            const int e = cand_idx[c];
+            const float* r_e = w.w_router + (size_t)e * D;
+            float logit = 0.0f;
+            for (int d = 0; d < D; ++d) logit += r_e[d] * x_t[d];
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(e, affinity, affinity + w.bias[e], K,
+                                    best_idx, best_affinity, best_score);
+        }
+#endif
+
+        // Normalize routing weights
+        float affinity_sum = 0.0f;
+        for (int k = 0; k < K; ++k) affinity_sum += best_affinity[k];
+        for (int k = 0; k < K; ++k) {
+            g_topk_indices[t][k] = best_idx[k];
+            g_topk_weights[t][k] = best_affinity[k] / affinity_sum;
+        }
+    }
+}
+
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
     const int D = w.d_model;
@@ -1466,8 +1651,13 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int opt_threads = 1;
 #endif
 
-    compute_routing(x, w, num_tokens, D, E, K);
     quantize_input(x, num_tokens, D);
+    // R12c: large-E router uses INT8 AMX GEMM + FP16 refinement
+    if (E >= 64 && g_amx_runtime_enabled) {
+        compute_routing_int8_amx(x, w, num_tokens, D, E, K);
+    } else {
+        compute_routing(x, w, num_tokens, D, E, K);
+    }
 
     compute_shared_expert(x, w, y, num_tokens, D, H);
 
