@@ -1023,12 +1023,29 @@ static void matmul_small_m_or_packed(
  */
 static void compute_shared_expert(const float* x, const MoEWeights& w,
                                   float* y, int num_tokens, int D, int H) {
-    matmul_gate_up(
-        g_quantized_x,
-        g_packed_shared_gate, g_packed_shared_up,
-        w.sh_gate, w.sh_up,
-        g_shared_gate_out, g_shared_up_out,
-        num_tokens, D, H);
+    // R21: parallelize shared-expert Gate/Up GEMM over 16-token blocks. The
+    // serial call was L2-bandwidth-bound for S4 (M=1024): A[1024x512] is reloaded
+    // once per N-tile. 16-row blocks split work across threads AND enable the
+    // fused gate/up path (reuse A-tile, halves A traffic). VTune showed
+    // compute_shared_expert was 17.3% of S4 CPU time.
+    {
+        static thread_local bool shared_amx_perm_gu = false;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
+        for (int t0 = 0; t0 < num_tokens; t0 += 16) {
+            if (g_amx_runtime_enabled && !shared_amx_perm_gu)
+                shared_amx_perm_gu = request_amx_permission();
+            const int m = (num_tokens - t0 < 16) ? (num_tokens - t0) : 16;
+            matmul_gate_up(
+                g_quantized_x + (size_t)t0 * D,
+                g_packed_shared_gate, g_packed_shared_up,
+                w.sh_gate, w.sh_up,
+                g_shared_gate_out + (size_t)t0 * H,
+                g_shared_up_out + (size_t)t0 * H,
+                m, D, H);
+        }
+    }
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
@@ -1070,9 +1087,25 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
             quantize_hidden_row(h_row, hq_row, H, max_abs);
     }
 
-    matmul_small_m_or_packed(
-        g_shared_quantized_gated, g_packed_shared_down, w.sh_down,
-        g_shared_down_out, num_tokens, H, D);
+    // R21: parallelize shared-expert Down GEMM over 16-token blocks (same
+    // L2-bandwidth rationale as Gate/Up; AMX permission is per-thread-persistent,
+    // so the check is a no-op after the Gate/Up region set it).
+    {
+        static thread_local bool shared_amx_perm_dn = false;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
+        for (int t0 = 0; t0 < num_tokens; t0 += 16) {
+            if (g_amx_runtime_enabled && !shared_amx_perm_dn)
+                shared_amx_perm_dn = request_amx_permission();
+            const int m = (num_tokens - t0 < 16) ? (num_tokens - t0) : 16;
+            matmul_small_m_or_packed(
+                g_shared_quantized_gated + (size_t)t0 * H,
+                g_packed_shared_down, w.sh_down,
+                g_shared_down_out + (size_t)t0 * D,
+                m, H, D);
+        }
+    }
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
