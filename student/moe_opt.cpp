@@ -1,4 +1,4 @@
-﻿// Main task: optimize the MoE forward pass.
+// Main task: optimize the MoE forward pass.
 //
 // Correctness-repaired version of the student's original AMX/AVX-512 design:
 //   router -> Top-K -> per-token W8A8 quantization -> expert grouping
@@ -1473,12 +1473,26 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
             }
         }
 
-#pragma omp for schedule(static)
-        for (size_t idx = 0; idx < ystride; ++idx) {
-            float s = 0.0f;
-            for (int th = 0; th < nthreads; ++th)
-                s += yacc_pool[(size_t)th * ystride + idx];
-            y[idx] += s;
+// R18b: threshold-based y_acc reduction.
+        // Large ystride (S4: 524288 elems=2MB/slice > L2): per-thread sequential pass
+        //   gives contiguous reads from yacc_pool (DRAM-BW friendly) -> +3.7% on S4.
+        // Small ystride (S3: 32768 elems=128KB/slice <= L2): strided reduction keeps
+        //   everything cache-resident and avoids nthreads-fold barrier overhead.
+        if (ystride >= 131072) {
+            for (int th = 0; th < nthreads; ++th) {
+                const float* y_acc_th = yacc_pool + (size_t)th * ystride;
+        #pragma omp for schedule(static)
+                for (size_t idx = 0; idx < ystride; ++idx)
+                    y[idx] += y_acc_th[idx];
+            }
+        } else {
+        #pragma omp for schedule(static)
+            for (size_t idx = 0; idx < ystride; ++idx) {
+                float s = 0.0f;
+                for (int th = 0; th < nthreads; ++th)
+                    s += yacc_pool[(size_t)th * ystride + idx];
+                y[idx] += s;
+            }
         }
     }
 }
