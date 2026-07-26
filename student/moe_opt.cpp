@@ -1023,22 +1023,20 @@ static void matmul_small_m_or_packed(
  */
 static void compute_shared_expert(const float* x, const MoEWeights& w,
                                   float* y, int num_tokens, int D, int H) {
-    // R21: parallelize shared-expert Gate/Up GEMM over 16-token blocks. The
-    // serial call was L2-bandwidth-bound for S4 (M=1024): A[1024x512] is reloaded
-    // once per N-tile. 16-row blocks split work across threads AND enable the
-    // fused gate/up path (reuse A-tile, halves A traffic). VTune showed
-    // compute_shared_expert was 17.3% of S4 CPU time.
-    // R21b: small batches (S1/S2, N<64) keep the plain serial call -- the OMP
-    // parallel-for construct itself adds ~15% overhead on S2 even when the if()
-    // clause serializes it, because the runtime still enters the construct.
-    if (num_tokens >= OMP_TOKEN_THRESHOLD) {
-        static thread_local bool shared_amx_perm_gu = false;
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
+    // R22: fuse 4 shared-expert OMP regions into 1 parallel{} to cut fork/join
+    // overhead. VTune (S3): libgomp = 22.5% of CPU, top hotspot. Each omp for
+    // retains an implicit barrier, preserving Gate/Up -> SwiGLU -> Down -> dequant
+    // data dependencies. if(N>=64) serializes small batches with 1 thread (no
+    // fork/join), avoiding code duplication and icache pressure.
+    static thread_local bool shared_amx_perm = false;
+#pragma omp parallel if(num_tokens >= OMP_TOKEN_THRESHOLD)
+    {
+        if (g_amx_runtime_enabled && !shared_amx_perm)
+            shared_amx_perm = request_amx_permission();
+
+        // --- Gate/Up GEMM (16-token blocks) ---
+#pragma omp for schedule(static)
         for (int t0 = 0; t0 < num_tokens; t0 += 16) {
-            if (g_amx_runtime_enabled && !shared_amx_perm_gu)
-                shared_amx_perm_gu = request_amx_permission();
             const int m = (num_tokens - t0 < 16) ? (num_tokens - t0) : 16;
             matmul_gate_up(
                 g_quantized_x + (size_t)t0 * D,
@@ -1048,19 +1046,11 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
                 g_shared_up_out + (size_t)t0 * H,
                 m, D, H);
         }
-    } else {
-        matmul_gate_up(
-            g_quantized_x,
-            g_packed_shared_gate, g_packed_shared_up,
-            w.sh_gate, w.sh_up,
-            g_shared_gate_out, g_shared_up_out,
-            num_tokens, D, H);
-    }
 
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
-#endif
-    for (int t = 0; t < num_tokens; ++t) {
+        // --- SwiGLU + quantize ---
+#pragma omp for schedule(static)
+        for (int t = 0; t < num_tokens; ++t) {
+
         const float scale_g = g_scale_shared_gate * g_x_scale[t];
         const float scale_u = g_scale_shared_up * g_x_scale[t];
         float* h_row = g_shared_gated_fp32 + (size_t)t * H;
@@ -1095,20 +1085,12 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
 #endif
         g_shared_gated_scale[t] =
             quantize_hidden_row(h_row, hq_row, H, max_abs);
-    }
+    
+        }
 
-    // R21: parallelize shared-expert Down GEMM over 16-token blocks (same
-    // L2-bandwidth rationale as Gate/Up; AMX permission is per-thread-persistent,
-    // so the check is a no-op after the Gate/Up region set it).
-    // R21b: small batches keep the plain serial call (same rationale as Gate/Up).
-    if (num_tokens >= OMP_TOKEN_THRESHOLD) {
-        static thread_local bool shared_amx_perm_dn = false;
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
+        // --- Down GEMM (16-token blocks) ---
+#pragma omp for schedule(static)
         for (int t0 = 0; t0 < num_tokens; t0 += 16) {
-            if (g_amx_runtime_enabled && !shared_amx_perm_dn)
-                shared_amx_perm_dn = request_amx_permission();
             const int m = (num_tokens - t0 < 16) ? (num_tokens - t0) : 16;
             matmul_small_m_or_packed(
                 g_shared_quantized_gated + (size_t)t0 * H,
@@ -1116,16 +1098,11 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
                 g_shared_down_out + (size_t)t0 * D,
                 m, H, D);
         }
-    } else {
-        matmul_small_m_or_packed(
-            g_shared_quantized_gated, g_packed_shared_down, w.sh_down,
-            g_shared_down_out, num_tokens, H, D);
-    }
 
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
-#endif
-    for (int t = 0; t < num_tokens; ++t) {
+        // --- Dequant + residual ---
+#pragma omp for schedule(static)
+        for (int t = 0; t < num_tokens; ++t) {
+
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
         const float* x_t = x + (size_t)t * D;
         float* y_t = y + (size_t)t * D;
@@ -1144,6 +1121,8 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
             y_t[d] = x_t[d] + (float)out_t[d] * dequant;
         }
 #endif
+    
+        }
     }
 }
 
