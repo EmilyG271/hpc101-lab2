@@ -1110,7 +1110,7 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
         }
 
         // --- Dequant + residual ---
-#pragma omp for schedule(static)
+#pragma omp for schedule(static) nowait
         for (int t = 0; t < num_tokens; ++t) {
 
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
@@ -1414,6 +1414,19 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
     float* yacc_pool = acquire_yacc_pool((size_t)nthreads * ystride);
     const size_t expert_elems = (size_t)D * H;
 
+    // R32: LPT (longest-processing-time-first) expert ordering. Sort expert
+    // indices by token count descending so schedule(dynamic) grabs the heaviest
+    // experts first. With few experts per thread (S3: 16 experts / 8 threads =
+    // 2 each) this pairs heavy+light per thread and cuts load-imbalance barrier
+    // spin (VTune: libgomp ~14% of S3 CPU). Float-accumulation order changes by
+    // <1e-7 (already non-deterministic under dynamic schedule), far below the
+    // 2e-3 RMSE threshold, so correctness is preserved.
+    int expert_order[MAX_NUM_EXPERTS];
+    for (int e = 0; e < E; ++e) expert_order[e] = e;
+    std::sort(expert_order, expert_order + E, [](int a, int b) {
+        return g_expert_token_count[a] > g_expert_token_count[b];
+    });
+
 #pragma omp parallel num_threads(nthreads)
     {
         const int tid = omp_get_thread_num();
@@ -1426,7 +1439,8 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
         std::memset(y_acc, 0, ystride * sizeof(float));
 
 #pragma omp for schedule(dynamic)
-        for (int e = 0; e < E; ++e) {
+        for (int ii = 0; ii < E; ++ii) {
+            const int e = expert_order[ii];
             const int count = g_expert_token_count[e];
             if (count == 0) continue;
 
@@ -1523,7 +1537,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
                     y[idx] += y_acc_th[idx];
             }
         } else {
-        #pragma omp for schedule(static)
+        #pragma omp for schedule(static) nowait
             for (size_t idx = 0; idx < ystride; ++idx) {
                 float s = 0.0f;
                 for (int th = 0; th < nthreads; ++th)
