@@ -36,6 +36,9 @@ static int g_topk_indices[MAX_NUM_TOKENS][MAX_TOP_K];
 static float g_topk_weights[MAX_NUM_TOKENS][MAX_TOP_K];
 static int g_expert_token_count[MAX_NUM_EXPERTS];
 static int g_expert_token_list[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
+// 分发阶段同时保存路由权重与原 Top-K 槽位，专家回写时无需再次扫描 K。
+static float g_expert_token_weight[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
+static uint8_t g_expert_topk_slot[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
 
 // -----------------------------------------------------------------------------
 // Compact runtime-layout activation/output buffers
@@ -97,7 +100,9 @@ static float g_scale_shared_up;
 static float g_scale_shared_down;
 
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
-alignas(64) static unsigned char g_tile_cfg[64];
+alignas(64) static thread_local unsigned char g_tile_cfg[64];
+// Tile 配置属于线程的扩展寄存器状态；缓存当前行数可跳过重复 LDTILECFG。
+static thread_local int g_last_tile_rows = -1;
 #endif
 static bool g_amx_runtime_enabled = false;
 
@@ -213,6 +218,9 @@ void preprocess(MoEWeights& w) {
     g_scale_shared_down = w.sh_s_down;
 
     g_amx_runtime_enabled = request_amx_permission();
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    g_last_tile_rows = -1;
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -225,9 +233,9 @@ void preprocess(MoEWeights& w) {
  * 功能：执行 z[t,e] = dot(x[t,:], w_router[e,:])，结果写入 g_logits。
  * Router 按实验要求保持 FP32，不参与 W8A8 专家矩阵的整数计算。
  *
- * 实现思路：外层遍历 token，中层遍历专家，最内层沿 D 维做点积归约。
- * AVX-512 构建中，每次加载 16 个 FP32，使用 FMA 累加到 ZMM 寄存器，最后
- * 通过 _mm512_reduce_add_ps 做水平归约。x 和 w_router 由普通 new[] 分配，
+ * 实现思路：外层遍历 token，AVX-512 路径每次并行处理 4 个专家，复用同一
+ * 个 x 向量并维护 4 条独立 FMA 累加链；每条指令处理 16 个 FP32，最后通过
+ * _mm512_reduce_add_ps 做水平归约。x 和 w_router 由普通 new[] 分配，
  * 不保证 64 字节对齐，因此必须使用 _mm512_loadu_ps，避免对齐加载异常。
  *
  * 向量化情况：
@@ -244,24 +252,52 @@ static inline void compute_logits(const float* x, const MoEWeights& w,
                                   int num_tokens, int D, int E) {
     for (int t = 0; t < num_tokens; ++t) {
         const float* x_t = x + (size_t)t * D;
+#if defined(__AVX512F__)
+        int e = 0;
+        // 一次计算 4 个专家：同一个 x_vec 被复用 4 次，减少输入向量重复加载，
+        // 同时形成 4 条互不依赖的 FMA 累加链，提高指令级并行度。
+        for (; e + 3 < E; e += 4) {
+            const float* r0 = w.w_router + (size_t)(e + 0) * D;
+            const float* r1 = w.w_router + (size_t)(e + 1) * D;
+            const float* r2 = w.w_router + (size_t)(e + 2) * D;
+            const float* r3 = w.w_router + (size_t)(e + 3) * D;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
+            for (int d = 0; d < D; d += 16) {
+                const __m512 xv = _mm512_loadu_ps(x_t + d);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r0 + d), acc0);
+                acc1 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r1 + d), acc1);
+                acc2 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r2 + d), acc2);
+                acc3 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r3 + d), acc3);
+            }
+            g_logits[t][e + 0] = _mm512_reduce_add_ps(acc0);
+            g_logits[t][e + 1] = _mm512_reduce_add_ps(acc1);
+            g_logits[t][e + 2] = _mm512_reduce_add_ps(acc2);
+            g_logits[t][e + 3] = _mm512_reduce_add_ps(acc3);
+        }
+
+        // E 不一定是 4 的倍数，处理最后 0~3 个专家。
+        for (; e < E; ++e) {
+            const float* r_e = w.w_router + (size_t)e * D;
+            __m512 acc = _mm512_setzero_ps();
+            for (int d = 0; d < D; d += 16) {
+                const __m512 xv = _mm512_loadu_ps(x_t + d);
+                acc = _mm512_fmadd_ps(
+                    xv, _mm512_loadu_ps(r_e + d), acc);
+            }
+            g_logits[t][e] = _mm512_reduce_add_ps(acc);
+        }
+#else
         for (int e = 0; e < E; ++e) {
             const float* r_e = w.w_router + (size_t)e * D;
-#if defined(__AVX512F__)
-            __m512 sum_vec = _mm512_setzero_ps();
-            for (int d = 0; d < D; d += 16) {
-                // x and framework weights are allocated with ordinary new;
-                // 64-byte alignment is not guaranteed, so aligned loads fault.
-                const __m512 x_vec = _mm512_loadu_ps(x_t + d);
-                const __m512 r_vec = _mm512_loadu_ps(r_e + d);
-                sum_vec = _mm512_fmadd_ps(x_vec, r_vec, sum_vec);
-            }
-            g_logits[t][e] = _mm512_reduce_add_ps(sum_vec);
-#else
             float sum = 0.0f;
             for (int d = 0; d < D; ++d) sum += r_e[d] * x_t[d];
             g_logits[t][e] = sum;
-#endif
         }
+#endif
     }
 }
 
@@ -342,8 +378,8 @@ static inline void compute_topk_weights(int num_tokens, int K) {
 /**
  * @brief 将 token 按其 Top-K 路由结果聚拢到各个专家的连续 token 列表中。
  *
- * 功能：构建 g_expert_token_count[e] 和 g_expert_token_list[e][slot]。
- * 这是把逐 token 的稀疏专家调用转换为逐专家批量 GEMM 的关键数据重排步骤。
+ * 功能：构建专家 token 列表，并同步保存每个分发项的路由权重和原 Top-K
+ * 槽位。这既把逐 token 调用转换为逐专家 GEMM，也消除了专家回写时的 K 次搜索。
  *
  * 实现思路：先清零 E 个专家的计数器，再遍历所有 token 的 K 个专家编号，
  * 将 token ID 追加到对应专家列表。随后每个专家可一次 Gather 出紧凑 A 矩阵，
@@ -363,6 +399,8 @@ static inline void dispatch_tokens_to_experts(int num_tokens, int E, int K) {
             const int e = g_topk_indices[t][k];
             const int slot = g_expert_token_count[e]++;
             g_expert_token_list[e][slot] = t;
+            g_expert_token_weight[e][slot] = g_topk_weights[t][k];
+            g_expert_topk_slot[e][slot] = (uint8_t)k;
         }
     }
 }
@@ -417,15 +455,15 @@ static inline void quantize_input(const float* x, int num_tokens, int D) {
         const __m512 scale_vec = _mm512_set1_ps(scale);
         const __m512 lo = _mm512_set1_ps(-127.0f);
         const __m512 hi = _mm512_set1_ps(127.0f);
-        alignas(64) int32_t tmp[16];
         for (int d = 0; d < D; d += 16) {
             __m512 q = _mm512_div_ps(_mm512_loadu_ps(x_t + d), scale_vec);
             q = _mm512_roundscale_ps(
                 q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             q = _mm512_min_ps(hi, _mm512_max_ps(lo, q));
-            _mm512_store_si512(reinterpret_cast<__m512i*>(tmp),
-                               _mm512_cvtps_epi32(q));
-            for (int i = 0; i < 16; ++i) q_t[d + i] = (int8_t)tmp[i];
+            const __m512i q_i32 = _mm512_cvtps_epi32(q);
+            // 16×INT32 直接窄化为 16×INT8，避免临时数组和 16 次标量写回。
+            const __m128i q_i8 = _mm512_cvtepi32_epi8(q_i32);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(q_t + d), q_i8);
         }
 #else
         for (int d = 0; d < D; ++d) {
@@ -443,30 +481,42 @@ static inline void quantize_input(const float* x, int num_tokens, int D) {
  * 功能：计算 s_h=max(abs(h))/127，并执行 h_q=round(h/s_h)。该步骤是 W8A8
  * 流水线中 Gate/Up 的 FP32 SwiGLU 与 Down INT8 矩阵乘之间的重量化边界。
  *
- * 实现思路：第一遍求该 token 隐藏向量的绝对值最大值；第二遍使用 lrintf
- * 舍入并饱和到 [-127,127]。返回的 s_h 用于 Down 输出的反量化：
- *     output_fp32 = output_int32 * s_h * s_down。
+ * 实现思路：SwiGLU 生成 hidden 时已经同步统计 max_abs，本函数直接计算 scale
+ * 并完成除法、最近偶数舍入、饱和及 INT32→INT8 窄化，避免再次扫描求最大值。
+ * 返回的 s_h 用于 Down 输出反量化：output_fp32=output_int32*s_h*s_down。
  *
- * 向量化情况：当前未显式向量化，保持与参考实现一致的 lrintf 舍入语义。
- * 编译器在高优化等级下仍可对 max/clamp 等简单循环尝试自动向量化。
+ * 向量化情况：AVX-512 路径每次处理 16 个 FP32，并用 VPMOVDB 风格窄化一次
+ * 写出 16 个 INT8；非 AVX-512 构建保留 lrintf 标量回退。
  *
- * @param src    一行 FP32 隐藏激活。
- * @param dst    输出 INT8 隐藏激活。
- * @param length 隐藏维度 H。
- * @return       当前行的激活 scale s_h。
+ * @param src     一行 FP32 隐藏激活。
+ * @param dst     输出 INT8 隐藏激活。
+ * @param length  隐藏维度 H。
+ * @param max_abs SwiGLU 计算阶段得到的该行绝对值最大值。
+ * @return        当前行的激活 scale s_h。
  */
 static inline float quantize_hidden_row(const float* src, int8_t* dst,
-                                        int length) {
-    float max_abs = 0.0f;
-    for (int i = 0; i < length; ++i) {
-        max_abs = std::max(max_abs, fabsf(src[i]));
-    }
+                                        int length, float max_abs) {
     const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+#if defined(__AVX512F__)
+    const __m512 scale_vec = _mm512_set1_ps(scale);
+    const __m512 lo = _mm512_set1_ps(-127.0f);
+    const __m512 hi = _mm512_set1_ps(127.0f);
+    for (int i = 0; i < length; i += 16) {
+        __m512 q = _mm512_div_ps(_mm512_loadu_ps(src + i), scale_vec);
+        q = _mm512_roundscale_ps(
+            q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        q = _mm512_min_ps(hi, _mm512_max_ps(lo, q));
+        const __m512i q_i32 = _mm512_cvtps_epi32(q);
+        const __m128i q_i8 = _mm512_cvtepi32_epi8(q_i32);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), q_i8);
+    }
+#else
     for (int i = 0; i < length; ++i) {
         long q = lrintf(src[i] / scale);
         q = std::max(-127L, std::min(127L, q));
         dst[i] = (int8_t)q;
     }
+#endif
     return scale;
 }
 
@@ -538,8 +588,8 @@ static inline void set_tile_shape(int tile, int rows, int bytes_per_row) {
  * rows_m 用于支持 token 数不是 16 倍数时的 M 维尾块。
  *
  * 实现思路：先将 TILECFG 全部清零，设置 palette_id=1，再调用
- * set_tile_shape() 填写三个 Tile，最后执行 _tile_loadconfig。每个 Tile 均满足
- * Sapphire Rapids AMX 的最多 16 行、每行最多 64 字节、总计最多 1 KiB 限制。
+ * set_tile_shape() 填写三个 Tile，最后执行 _tile_loadconfig。若当前线程已经
+ * 使用相同 rows_m，则直接复用配置。每个 Tile 均满足最多 16 行、每行 64 字节限制。
  *
  * 向量化情况：使用 AMX Tile 配置指令，但不执行乘加；实际矩阵运算由
  * amx_matmul_packed() 中的 _tile_dpbssd 完成。
@@ -547,6 +597,10 @@ static inline void set_tile_shape(int tile, int rows, int bytes_per_row) {
  * @param rows_m 当前 M 分块的有效 token 行数，范围为 1..16。
  */
 static inline void configure_amx_tiles(int rows_m) {
+    // Gate/Up/Down 的 Tile K/N 分块均固定为 64/16；只有 M 尾块行数变化。
+    // 如果当前线程已经加载相同行数的配置，直接复用硬件 Tile 状态。
+    if (g_last_tile_rows == rows_m) return;
+
     // Every AMX tile is at most 16 rows x 64 bytes. For TDPBSSD:
     //   C: [rows_m, 16] int32 -> 64 bytes/row
     //   A: [rows_m, 64] int8  -> 64 bytes/row
@@ -557,6 +611,7 @@ static inline void configure_amx_tiles(int rows_m) {
     set_tile_shape(1, rows_m, 64);
     set_tile_shape(2, 16, 64);
     _tile_loadconfig(g_tile_cfg);
+    g_last_tile_rows = rows_m;
 }
 
 /**
@@ -650,8 +705,8 @@ static void matmul_packed(const int8_t* A, const int8_t* B_pack, int32_t* C,
  * 所有矩阵缓冲区均使用运行时 D/H 的紧凑行跨度，避免 MAX_* 二维数组造成
  * 的物理 stride 错误。
  *
- * 向量化情况：Gate、Up、Down 矩阵乘通过 matmul_packed() 使用 AMX；若 AMX
- * 不可用则走标量回退。SiLU 和隐藏重量化当前为标量 FP32 循环。
+ * 向量化情况：Gate、Up、Down 使用 AMX；隐藏 INT8 重量化和 Down 反量化
+ * 使用 AVX-512。SiLU 中的 expf 与 max_abs 同步统计目前仍为标量循环。
  */
 static void compute_shared_expert(const MoEWeights& w, float* y,
                                   int num_tokens, int D, int H) {
@@ -666,15 +721,20 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
         const float scale_u = g_scale_shared_up * g_x_scale[t];
         float* h_row = g_shared_gated_fp32 + (size_t)t * H;
         int8_t* hq_row = g_shared_quantized_gated + (size_t)t * H;
+        float max_abs = 0.0f;
 
+        // 生成 SwiGLU hidden 的同时统计 max_abs，避免量化函数再次扫描一遍。
         for (int h = 0; h < H; ++h) {
             const float gate =
                 (float)g_shared_gate_out[(size_t)t * H + h] * scale_g;
             const float up =
                 (float)g_shared_up_out[(size_t)t * H + h] * scale_u;
-            h_row[h] = (gate / (1.0f + expf(-gate))) * up;
+            const float value = (gate / (1.0f + expf(-gate))) * up;
+            h_row[h] = value;
+            max_abs = std::max(max_abs, fabsf(value));
         }
-        g_shared_gated_scale[t] = quantize_hidden_row(h_row, hq_row, H);
+        g_shared_gated_scale[t] =
+            quantize_hidden_row(h_row, hq_row, H, max_abs);
     }
 
     matmul_packed(g_shared_quantized_gated, g_packed_shared_down,
@@ -684,9 +744,20 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
         float* y_t = y + (size_t)t * D;
         const int32_t* out_t = g_shared_down_out + (size_t)t * D;
+#if defined(__AVX512F__)
+        const __m512 dequant_vec = _mm512_set1_ps(dequant);
+        for (int d = 0; d < D; d += 16) {
+            const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
+            const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+            const __m512 contribution = _mm512_mul_ps(out_fp32, dequant_vec);
+            const __m512 y_vec = _mm512_loadu_ps(y_t + d);
+            _mm512_storeu_ps(y_t + d, _mm512_add_ps(y_vec, contribution));
+        }
+#else
         for (int d = 0; d < D; ++d) {
             y_t[d] += (float)out_t[d] * dequant;
         }
+#endif
     }
 }
 
@@ -711,7 +782,7 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
  * 向量化情况：
  * - Router 点积和输入量化在可用时使用 AVX-512；
  * - 专家 Gate/Up/Down 投影在可用时使用 Intel AMX-INT8；
- * - Top-K、Sigmoid/SwiGLU、分发、最终加权累加保持标量实现；
+ * - Top-K、Sigmoid/SwiGLU 和分发保持标量；Down 反量化/加权使用 AVX-512；
  * - 未支持 AVX-512/AMX 的构建自动使用等价标量路径。
  *
  * @param x          FP32 输入，布局 [num_tokens,D]。
@@ -756,15 +827,19 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             const float scale_u = g_scale_up[e] * g_x_scale[t];
             float* h_row = g_gated_fp32 + (size_t)i * H;
             int8_t* hq_row = g_quantized_gated + (size_t)i * H;
+            float max_abs = 0.0f;
 
             for (int h = 0; h < H; ++h) {
                 const float gate =
                     (float)g_gate_out[(size_t)i * H + h] * scale_g;
                 const float up =
                     (float)g_up_out[(size_t)i * H + h] * scale_u;
-                h_row[h] = (gate / (1.0f + expf(-gate))) * up;
+                const float value = (gate / (1.0f + expf(-gate))) * up;
+                h_row[h] = value;
+                max_abs = std::max(max_abs, fabsf(value));
             }
-            g_gated_scale[i] = quantize_hidden_row(h_row, hq_row, H);
+            g_gated_scale[i] =
+                quantize_hidden_row(h_row, hq_row, H, max_abs);
         }
 
         matmul_packed(g_quantized_gated, g_packed_down[e], g_down_out,
@@ -772,20 +847,33 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 
         for (int i = 0; i < count; ++i) {
             const int t = g_expert_token_list[e][i];
-            float route_weight = 0.0f;
-            for (int k = 0; k < K; ++k) {
-                if (g_topk_indices[t][k] == e) {
-                    route_weight = g_topk_weights[t][k];
-                    break;
-                }
-            }
+            const float route_weight = g_expert_token_weight[e][i];
+            // Top-K 槽位已在分发时保存，后续专家并行重构时可直接定位输出槽。
+            const uint8_t topk_slot = g_expert_topk_slot[e][i];
+            (void)topk_slot;
 
             const float dequant = g_gated_scale[i] * g_scale_down[e];
             float* y_t = y + (size_t)t * D;
             const int32_t* out_t = g_down_out + (size_t)i * D;
+#if defined(__AVX512F__)
+            const __m512 dequant_vec = _mm512_set1_ps(dequant);
+            const __m512 weight_vec = _mm512_set1_ps(route_weight);
+            for (int d = 0; d < D; d += 16) {
+                const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
+                const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+                const __m512 dequantized =
+                    _mm512_mul_ps(out_fp32, dequant_vec);
+                const __m512 contribution =
+                    _mm512_mul_ps(weight_vec, dequantized);
+                const __m512 y_vec = _mm512_loadu_ps(y_t + d);
+                _mm512_storeu_ps(y_t + d,
+                                 _mm512_add_ps(y_vec, contribution));
+            }
+#else
             for (int d = 0; d < D; ++d) {
                 y_t[d] += route_weight * ((float)out_t[d] * dequant);
             }
+#endif
         }
     }
 }
