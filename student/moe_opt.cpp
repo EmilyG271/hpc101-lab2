@@ -410,12 +410,8 @@ static inline __m512 silu512_ps(__m512 v) {
 }
 #endif
 
-static inline void compute_routing(const float* x, const MoEWeights& w,
-                                   int num_tokens, int D, int E, int K) {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
-#endif
-    for (int t = 0; t < num_tokens; ++t) {
+static inline void compute_routing_token(int t, const float* x, const MoEWeights& w,
+                                         int D, int E, int K) {
         const float* x_t = x + (size_t)t * D;
         int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
         float best_affinity[MAX_TOP_K] = {};
@@ -483,7 +479,14 @@ static inline void compute_routing(const float* x, const MoEWeights& w,
             g_topk_indices[t][k] = best_idx[k];
             g_topk_weights[t][k] = best_affinity[k] / affinity_sum;
         }
-    }
+}
+
+static inline void compute_routing(const float* x, const MoEWeights& w,
+                                   int num_tokens, int D, int E, int K) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
+    for (int t = 0; t < num_tokens; ++t) compute_routing_token(t, x, w, D, E, K);
 }
 
 /**
@@ -539,11 +542,7 @@ static inline void dispatch_tokens_to_experts(int num_tokens, int E, int K) {
  * @param num_tokens token 数量。
  * @param D          每个 token 的元素数量。
  */
-static inline void quantize_input(const float* x, int num_tokens, int D) {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
-#endif
-    for (int t = 0; t < num_tokens; ++t) {
+static inline void quantize_input_token(int t, const float* x, int D) {
         const float* x_t = x + (size_t)t * D;
         int8_t* q_t = g_quantized_x + (size_t)t * D;
 
@@ -585,7 +584,13 @@ static inline void quantize_input(const float* x, int num_tokens, int D) {
             q_t[d] = (int8_t)q;
         }
 #endif
-    }
+}
+
+static inline void quantize_input(const float* x, int num_tokens, int D) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
+    for (int t = 0; t < num_tokens; ++t) quantize_input_token(t, x, D);
 }
 
 /**
@@ -1714,13 +1719,34 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int opt_threads = 1;
 #endif
 
+#if defined(_OPENMP)
+    // R30: E<64 路径将 quantize_input 与 compute_routing 合并进同一 parallel 区域，
+    // 消除一次 fork/join（VTune 显示 S3 libgomp 开销约 44%）。
+    if (num_tokens >= OMP_TOKEN_THRESHOLD && !(E >= 64 && g_amx_runtime_enabled)) {
+#pragma omp parallel
+        {
+#pragma omp for schedule(static)
+            for (int t = 0; t < num_tokens; ++t) {
+                quantize_input_token(t, x, D);
+                compute_routing_token(t, x, w, D, E, K);
+            }
+        }
+    } else {
+        quantize_input(x, num_tokens, D);
+        if (E >= 64 && g_amx_runtime_enabled) {
+            compute_routing_int8_amx(x, w, num_tokens, D, E, K);
+        } else {
+            compute_routing(x, w, num_tokens, D, E, K);
+        }
+    }
+#else
     quantize_input(x, num_tokens, D);
-    // R12c: large-E router uses INT8 AMX GEMM + FP16 refinement
     if (E >= 64 && g_amx_runtime_enabled) {
         compute_routing_int8_amx(x, w, num_tokens, D, E, K);
     } else {
         compute_routing(x, w, num_tokens, D, E, K);
     }
+#endif
 
     compute_shared_expert(x, w, y, num_tokens, D, H);
 
