@@ -102,6 +102,8 @@ alignas(64) static thread_local unsigned char g_tile_cfg[64];
 static thread_local int g_last_tile_rows = -1;
 #endif
 static bool g_amx_runtime_enabled = false;
+// 小批量保持串行，避免 OpenMP 团队创建/调度开销影响 S1、S2。
+static constexpr int OMP_TOKEN_THRESHOLD = 64;
 
 /**
  * @brief 将框架的输出通道优先 INT8 权重转置并打包为 AMX TDPBSSD 所需布局。
@@ -265,6 +267,9 @@ static inline void insert_routing_candidate(
  */
 static inline void compute_routing(const float* x, const MoEWeights& w,
                                    int num_tokens, int D, int E, int K) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
     for (int t = 0; t < num_tokens; ++t) {
         const float* x_t = x + (size_t)t * D;
         int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
@@ -392,6 +397,9 @@ static inline void dispatch_tokens_to_experts(int num_tokens, int E, int K) {
  * @param D          每个 token 的元素数量。
  */
 static inline void quantize_input(const float* x, int num_tokens, int D) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
     for (int t = 0; t < num_tokens; ++t) {
         const float* x_t = x + (size_t)t * D;
         int8_t* q_t = g_quantized_x + (size_t)t * D;
@@ -867,7 +875,8 @@ static void matmul_small_m_or_packed(
  * 的物理 stride 错误。
  *
  * 向量化情况：常规 Gate/Up/Down 使用 AMX；仅对计算量足够大的小 M 使用
- * AVX-512BW 专用路径。hidden 重量化和 Down 反量化使用 AVX-512。
+ * AVX-512BW 专用路径。Token 级 SwiGLU/输出合并使用 OpenMP，hidden 重量化
+ * 和 Down 反量化使用 AVX-512；N<64 时自动保持串行。
  */
 static void compute_shared_expert(const float* x, const MoEWeights& w,
                                   float* y, int num_tokens, int D, int H) {
@@ -878,6 +887,9 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
         g_shared_gate_out, g_shared_up_out,
         num_tokens, D, H);
 
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
     for (int t = 0; t < num_tokens; ++t) {
         const float scale_g = g_scale_shared_gate * g_x_scale[t];
         const float scale_u = g_scale_shared_up * g_x_scale[t];
@@ -903,6 +915,9 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
         g_shared_quantized_gated, g_packed_shared_down, w.sh_down,
         g_shared_down_out, num_tokens, H, D);
 
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+#endif
     for (int t = 0; t < num_tokens; ++t) {
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
         const float* x_t = x + (size_t)t * D;
