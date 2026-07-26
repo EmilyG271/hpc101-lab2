@@ -101,6 +101,9 @@ static float g_scale_shared_gate;
 static float g_scale_shared_up;
 static float g_scale_shared_down;
 
+// R10: Router 权重 FP16 存储（带宽降 2x，cvt 后 FP32 计算精度无损）
+alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
+
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
 alignas(64) static thread_local unsigned char g_tile_cfg[64];
 // Tile 配置属于线程的扩展寄存器状态；缓存当前行数可跳过重复 LDTILECFG。
@@ -268,6 +271,16 @@ void preprocess(MoEWeights& w) {
     g_scale_shared_up = w.sh_s_up;
     g_scale_shared_down = w.sh_s_down;
 
+    // R10: router 权重 FP32->FP16（带宽降 2x）
+    for (int e = 0; e < E; ++e) {
+        const float* rw = w.w_router + (size_t)e * D;
+        __m256i* wf = reinterpret_cast<__m256i*>(g_router_f16 + (size_t)e * D);
+        for (int d = 0; d < D; d += 16) {
+            __m256i h = _mm512_cvtps_ph(_mm512_loadu_ps(rw + d), _MM_FROUND_CUR_DIRECTION);
+            _mm256_storeu_si256(wf + d / 16, h);
+        }
+    }
+
     g_amx_runtime_enabled = request_amx_permission();
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     g_last_tile_rows = -1;
@@ -358,50 +371,42 @@ static inline void compute_routing(const float* x, const MoEWeights& w,
         float best_score[MAX_TOP_K] = {};
 
 #if defined(__AVX512F__)
+        // R10: w_router 存 FP16（带宽降 2x），加载后 cvt FP32 再 FP32 fmadd（精度无损）
         int e = 0;
         for (; e + 3 < E; e += 4) {
-            const float* r0 = w.w_router + (size_t)(e + 0) * D;
-            const float* r1 = w.w_router + (size_t)(e + 1) * D;
-            const float* r2 = w.w_router + (size_t)(e + 2) * D;
-            const float* r3 = w.w_router + (size_t)(e + 3) * D;
+            const __m256i* r0 = reinterpret_cast<const __m256i*>(g_router_f16 + (size_t)(e + 0) * D);
+            const __m256i* r1 = reinterpret_cast<const __m256i*>(g_router_f16 + (size_t)(e + 1) * D);
+            const __m256i* r2 = reinterpret_cast<const __m256i*>(g_router_f16 + (size_t)(e + 2) * D);
+            const __m256i* r3 = reinterpret_cast<const __m256i*>(g_router_f16 + (size_t)(e + 3) * D);
             __m512 acc0 = _mm512_setzero_ps();
             __m512 acc1 = _mm512_setzero_ps();
             __m512 acc2 = _mm512_setzero_ps();
             __m512 acc3 = _mm512_setzero_ps();
-
             for (int d = 0; d < D; d += 16) {
                 const __m512 xv = _mm512_loadu_ps(x_t + d);
-                acc0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r0 + d), acc0);
-                acc1 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r1 + d), acc1);
-                acc2 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r2 + d), acc2);
-                acc3 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(r3 + d), acc3);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(_mm256_loadu_si256(r0 + d / 16)), acc0);
+                acc1 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(_mm256_loadu_si256(r1 + d / 16)), acc1);
+                acc2 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(_mm256_loadu_si256(r2 + d / 16)), acc2);
+                acc3 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(_mm256_loadu_si256(r3 + d / 16)), acc3);
             }
-
             const float logits[4] = {
                 _mm512_reduce_add_ps(acc0), _mm512_reduce_add_ps(acc1),
                 _mm512_reduce_add_ps(acc2), _mm512_reduce_add_ps(acc3)};
             for (int j = 0; j < 4; ++j) {
-                const float affinity =
-                    1.0f / (1.0f + expf(-logits[j]));
-                insert_routing_candidate(
-                    e + j, affinity, affinity + w.bias[e + j], K,
-                    best_idx, best_affinity, best_score);
+                const float affinity = 1.0f / (1.0f + expf(-logits[j]));
+                insert_routing_candidate(e + j, affinity, affinity + w.bias[e + j], K, best_idx, best_affinity, best_score);
             }
         }
-
         for (; e < E; ++e) {
-            const float* r_e = w.w_router + (size_t)e * D;
+            const __m256i* r_e = reinterpret_cast<const __m256i*>(g_router_f16 + (size_t)e * D);
             __m512 acc = _mm512_setzero_ps();
             for (int d = 0; d < D; d += 16) {
                 const __m512 xv = _mm512_loadu_ps(x_t + d);
-                acc = _mm512_fmadd_ps(
-                    xv, _mm512_loadu_ps(r_e + d), acc);
+                acc = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(_mm256_loadu_si256(r_e + d / 16)), acc);
             }
             const float logit = _mm512_reduce_add_ps(acc);
             const float affinity = 1.0f / (1.0f + expf(-logit));
-            insert_routing_candidate(
-                e, affinity, affinity + w.bias[e], K,
-                best_idx, best_affinity, best_score);
+            insert_routing_candidate(e, affinity, affinity + w.bias[e], K, best_idx, best_affinity, best_score);
         }
 #else
         for (int e = 0; e < E; ++e) {
@@ -409,9 +414,7 @@ static inline void compute_routing(const float* x, const MoEWeights& w,
             float logit = 0.0f;
             for (int d = 0; d < D; ++d) logit += r_e[d] * x_t[d];
             const float affinity = 1.0f / (1.0f + expf(-logit));
-            insert_routing_candidate(
-                e, affinity, affinity + w.bias[e], K,
-                best_idx, best_affinity, best_score);
+            insert_routing_candidate(e, affinity, affinity + w.bias[e], K, best_idx, best_affinity, best_score);
         }
 #endif
 
