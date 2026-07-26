@@ -521,6 +521,121 @@ static inline float quantize_hidden_row(const float* src, int8_t* dst,
 }
 
 // -----------------------------------------------------------------------------
+// Small-M kernels
+//
+// 当 M<=4 时，AMX 的 16 行 Tile 严重欠填充。这里直接读取框架原始的输出通道
+// 优先权重 W[N,K]，用 AVX-512BW 将 signed INT8 扩展到 INT16，再用 VPMADDWD
+// 对相邻两项求和并累加到 INT32。一次同时处理 4 个输出通道以复用 A。
+// -----------------------------------------------------------------------------
+
+static constexpr int SMALL_M_THRESHOLD = 4;
+
+static void small_m_gate_up_output_major(
+    const int8_t* A, const int8_t* W_gate, const int8_t* W_up,
+    int32_t* C_gate, int32_t* C_up, int M, int K, int N) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    for (int m = 0; m < M; ++m) {
+        const int8_t* a_row = A + (size_t)m * K;
+        for (int n0 = 0; n0 < N; n0 += 4) {
+            __m512i gate_acc[4] = {
+                _mm512_setzero_si512(), _mm512_setzero_si512(),
+                _mm512_setzero_si512(), _mm512_setzero_si512()};
+            __m512i up_acc[4] = {
+                _mm512_setzero_si512(), _mm512_setzero_si512(),
+                _mm512_setzero_si512(), _mm512_setzero_si512()};
+
+            for (int k0 = 0; k0 < K; k0 += 32) {
+                const __m256i a_i8 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(a_row + k0));
+                const __m512i a_i16 = _mm512_cvtepi8_epi16(a_i8);
+
+                for (int j = 0; j < 4; ++j) {
+                    const int8_t* wg = W_gate + (size_t)(n0 + j) * K + k0;
+                    const int8_t* wu = W_up + (size_t)(n0 + j) * K + k0;
+                    const __m512i wg_i16 = _mm512_cvtepi8_epi16(
+                        _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(wg)));
+                    const __m512i wu_i16 = _mm512_cvtepi8_epi16(
+                        _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(wu)));
+                    gate_acc[j] = _mm512_add_epi32(
+                        gate_acc[j], _mm512_madd_epi16(a_i16, wg_i16));
+                    up_acc[j] = _mm512_add_epi32(
+                        up_acc[j], _mm512_madd_epi16(a_i16, wu_i16));
+                }
+            }
+
+            for (int j = 0; j < 4; ++j) {
+                C_gate[(size_t)m * N + n0 + j] =
+                    _mm512_reduce_add_epi32(gate_acc[j]);
+                C_up[(size_t)m * N + n0 + j] =
+                    _mm512_reduce_add_epi32(up_acc[j]);
+            }
+        }
+    }
+#else
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            int32_t gate_acc = 0;
+            int32_t up_acc = 0;
+            for (int k = 0; k < K; ++k) {
+                const int32_t a = (int32_t)A[(size_t)m * K + k];
+                gate_acc += a * (int32_t)W_gate[(size_t)n * K + k];
+                up_acc += a * (int32_t)W_up[(size_t)n * K + k];
+            }
+            C_gate[(size_t)m * N + n] = gate_acc;
+            C_up[(size_t)m * N + n] = up_acc;
+        }
+    }
+#endif
+}
+
+static void small_m_matmul_output_major(
+    const int8_t* A, const int8_t* W, int32_t* C,
+    int M, int K, int N) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    for (int m = 0; m < M; ++m) {
+        const int8_t* a_row = A + (size_t)m * K;
+        for (int n0 = 0; n0 < N; n0 += 4) {
+            __m512i acc[4] = {
+                _mm512_setzero_si512(), _mm512_setzero_si512(),
+                _mm512_setzero_si512(), _mm512_setzero_si512()};
+
+            for (int k0 = 0; k0 < K; k0 += 32) {
+                const __m256i a_i8 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(a_row + k0));
+                const __m512i a_i16 = _mm512_cvtepi8_epi16(a_i8);
+                for (int j = 0; j < 4; ++j) {
+                    const int8_t* w_row = W + (size_t)(n0 + j) * K + k0;
+                    const __m512i w_i16 = _mm512_cvtepi8_epi16(
+                        _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(w_row)));
+                    acc[j] = _mm512_add_epi32(
+                        acc[j], _mm512_madd_epi16(a_i16, w_i16));
+                }
+            }
+
+            for (int j = 0; j < 4; ++j) {
+                C[(size_t)m * N + n0 + j] =
+                    _mm512_reduce_add_epi32(acc[j]);
+            }
+        }
+    }
+#else
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; ++k) {
+                acc += (int32_t)A[(size_t)m * K + k] *
+                       (int32_t)W[(size_t)n * K + k];
+            }
+            C[(size_t)m * N + n] = acc;
+        }
+    }
+#endif
+}
+
+// -----------------------------------------------------------------------------
 // AMX INT8 GEMM. The scalar branch is a build/runtime fallback; the algorithm
 // and packed weight layout are identical, which also makes local verification
 // possible on machines or compilers without AMX.
@@ -579,12 +694,10 @@ static inline void set_tile_shape(int tile, int rows, int bytes_per_row) {
 }
 
 /**
- * @brief 为一个 16×64×16 的有符号 INT8 AMX 分块配置 Tile 0、1、2。
+ * @brief 配置融合 Gate/Up 与普通 Down 共用的 AMX Tile 形状。
  *
- * 功能：构造并加载如下合法 Tile 形状：
- * - Tile 0：C 累加器，[rows_m,16] INT32，每行 16*4=64 字节；
- * - Tile 1：A 输入块，[rows_m,64] INT8，每行 64 字节；
- * - Tile 2：B 打包块，[16,16*4] INT8，每行 64 字节。
+ * 功能：Tile0/1 分别作为 Gate/Up 的 INT32 累加器，Tile2 保存 A，Tile3/4
+ * 保存 Gate/Up 的打包权重。普通 Down 复用 Tile0、Tile2、Tile3。
  * rows_m 用于支持 token 数不是 16 倍数时的 M 维尾块。
  *
  * 实现思路：先将 TILECFG 全部清零，设置 palette_id=1，再调用
@@ -601,15 +714,19 @@ static inline void configure_amx_tiles(int rows_m) {
     // 如果当前线程已经加载相同行数的配置，直接复用硬件 Tile 状态。
     if (g_last_tile_rows == rows_m) return;
 
-    // Every AMX tile is at most 16 rows x 64 bytes. For TDPBSSD:
-    //   C: [rows_m, 16] int32 -> 64 bytes/row
-    //   A: [rows_m, 64] int8  -> 64 bytes/row
-    //   B: [16, 16*4] int8    -> 64 bytes/row
+    // 一份公共配置同时服务融合 Gate/Up 和普通 Down：
+    //   tile0: Gate/普通 C，[rows_m,16] int32
+    //   tile1: Up C，[rows_m,16] int32
+    //   tile2: A，[rows_m,64] int8
+    //   tile3: Gate/普通 B，[16,16*4] int8
+    //   tile4: Up B，[16,16*4] int8
     std::memset(g_tile_cfg, 0, sizeof(g_tile_cfg));
     g_tile_cfg[0] = 1;
     set_tile_shape(0, rows_m, 64);
     set_tile_shape(1, rows_m, 64);
-    set_tile_shape(2, 16, 64);
+    set_tile_shape(2, rows_m, 64);
+    set_tile_shape(3, 16, 64);
+    set_tile_shape(4, 16, 64);
     _tile_loadconfig(g_tile_cfg);
     g_last_tile_rows = rows_m;
 }
@@ -650,13 +767,48 @@ static void amx_matmul_packed(const int8_t* A, const int8_t* B_pack,
         for (int n0 = 0; n0 < N; n0 += TILE_N) {
             _tile_zero(0);
             for (int k0 = 0; k0 < K; k0 += TILE_K) {
-                _tile_loadd(1, A + (size_t)m0 * K + k0, K);
-                _tile_loadd(2,
+                _tile_loadd(2, A + (size_t)m0 * K + k0, K);
+                _tile_loadd(3,
                             B_pack + (size_t)(k0 / 4) * (N * 4) + n0 * 4,
                             N * 4);
-                _tile_dpbssd(0, 1, 2);
+                _tile_dpbssd(0, 2, 3);
             }
             _tile_stored(0, C + (size_t)m0 * N + n0, N * 4);
+        }
+    }
+}
+
+// Gate 和 Up 具有相同的 A/M/K/N。融合后每个 K-block 只加载一次 A，并用
+// tile0/tile1 维护两条独立累加链，分别消费 Gate/Up 的打包权重。
+static void amx_matmul_gate_up_packed(
+    const int8_t* A, const int8_t* B_gate_pack, const int8_t* B_up_pack,
+    int32_t* C_gate, int32_t* C_up, int M, int K, int N) {
+    constexpr int TILE_M = 16;
+    constexpr int TILE_K = 64;
+    constexpr int TILE_N = 16;
+
+    for (int m0 = 0; m0 < M; m0 += TILE_M) {
+        const int rows_m = std::min(TILE_M, M - m0);
+        configure_amx_tiles(rows_m);
+
+        for (int n0 = 0; n0 < N; n0 += TILE_N) {
+            _tile_zero(0);
+            _tile_zero(1);
+            for (int k0 = 0; k0 < K; k0 += TILE_K) {
+                _tile_loadd(2, A + (size_t)m0 * K + k0, K);
+                _tile_loadd(
+                    3,
+                    B_gate_pack + (size_t)(k0 / 4) * (N * 4) + n0 * 4,
+                    N * 4);
+                _tile_loadd(
+                    4,
+                    B_up_pack + (size_t)(k0 / 4) * (N * 4) + n0 * 4,
+                    N * 4);
+                _tile_dpbssd(0, 2, 3);
+                _tile_dpbssd(1, 2, 4);
+            }
+            _tile_stored(0, C_gate + (size_t)m0 * N + n0, N * 4);
+            _tile_stored(1, C_up + (size_t)m0 * N + n0, N * 4);
         }
     }
 }
@@ -686,6 +838,42 @@ static void matmul_packed(const int8_t* A, const int8_t* B_pack, int32_t* C,
     scalar_matmul_packed(A, B_pack, C, M, K, N);
 }
 
+// Gate/Up 统一分派：小 M 使用输出通道优先 AVX-512BW kernel；其余情况优先
+// 使用融合 AMX kernel。无 AMX 时仍可用原打包布局的标量实现验证正确性。
+static void matmul_gate_up(
+    const int8_t* A,
+    const int8_t* B_gate_pack, const int8_t* B_up_pack,
+    const int8_t* W_gate, const int8_t* W_up,
+    int32_t* C_gate, int32_t* C_up,
+    int M, int K, int N) {
+    if (M <= SMALL_M_THRESHOLD) {
+        small_m_gate_up_output_major(
+            A, W_gate, W_up, C_gate, C_up, M, K, N);
+        return;
+    }
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (g_amx_runtime_enabled) {
+        amx_matmul_gate_up_packed(
+            A, B_gate_pack, B_up_pack, C_gate, C_up, M, K, N);
+        return;
+    }
+#endif
+    scalar_matmul_packed(A, B_gate_pack, C_gate, M, K, N);
+    scalar_matmul_packed(A, B_up_pack, C_up, M, K, N);
+}
+
+// Down/普通单矩阵分派：M<=4 时读取连续的原始 W[N,K]，避免欠填充 AMX；
+// 较大 M 保持打包 AMX 路径。
+static void matmul_small_m_or_packed(
+    const int8_t* A, const int8_t* B_pack, const int8_t* W,
+    int32_t* C, int M, int K, int N) {
+    if (M <= SMALL_M_THRESHOLD) {
+        small_m_matmul_output_major(A, W, C, M, K, N);
+        return;
+    }
+    matmul_packed(A, B_pack, C, M, K, N);
+}
+
 // -----------------------------------------------------------------------------
 // Shared and routed experts
 // -----------------------------------------------------------------------------
@@ -697,7 +885,7 @@ static void matmul_packed(const int8_t* A, const int8_t* B_pack, int32_t* C,
  * 量化、Down 投影和反量化累加。共享专家路由权重固定为 1。
  *
  * 实现思路：
- * 1. 对全部 token 批量执行 INT8 Gate/Up GEMM；
+ * 1. M<=4 时使用 AVX-512BW 小矩阵 kernel，否则融合 Gate/Up AMX GEMM；
  * 2. 使用输入 scale 与权重 scale 将 INT32 投影反量化为 FP32；
  * 3. 计算 SiLU(gate)*up，并逐 token 重新量化为 INT8；
  * 4. 批量执行 INT8 Down GEMM；
@@ -705,16 +893,17 @@ static void matmul_packed(const int8_t* A, const int8_t* B_pack, int32_t* C,
  * 所有矩阵缓冲区均使用运行时 D/H 的紧凑行跨度，避免 MAX_* 二维数组造成
  * 的物理 stride 错误。
  *
- * 向量化情况：Gate、Up、Down 使用 AMX；隐藏 INT8 重量化和 Down 反量化
- * 使用 AVX-512。SiLU 中的 expf 与 max_abs 同步统计目前仍为标量循环。
+ * 向量化情况：大 M 的 Gate/Up 使用融合 AMX，Down 使用普通 AMX；M<=4 时
+ * 使用 AVX-512BW 专用路径。hidden 重量化和 Down 反量化使用 AVX-512。
  */
 static void compute_shared_expert(const MoEWeights& w, float* y,
                                   int num_tokens, int D, int H) {
-    (void)w;
-    matmul_packed(g_quantized_x, g_packed_shared_gate, g_shared_gate_out,
-                  num_tokens, D, H);
-    matmul_packed(g_quantized_x, g_packed_shared_up, g_shared_up_out,
-                  num_tokens, D, H);
+    matmul_gate_up(
+        g_quantized_x,
+        g_packed_shared_gate, g_packed_shared_up,
+        w.sh_gate, w.sh_up,
+        g_shared_gate_out, g_shared_up_out,
+        num_tokens, D, H);
 
     for (int t = 0; t < num_tokens; ++t) {
         const float scale_g = g_scale_shared_gate * g_x_scale[t];
@@ -737,8 +926,9 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
             quantize_hidden_row(h_row, hq_row, H, max_abs);
     }
 
-    matmul_packed(g_shared_quantized_gated, g_packed_shared_down,
-                  g_shared_down_out, num_tokens, H, D);
+    matmul_small_m_or_packed(
+        g_shared_quantized_gated, g_packed_shared_down, w.sh_down,
+        g_shared_down_out, num_tokens, H, D);
 
     for (int t = 0; t < num_tokens; ++t) {
         const float dequant = g_shared_gated_scale[t] * g_scale_shared_down;
@@ -781,7 +971,7 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
  *
  * 向量化情况：
  * - Router 点积和输入量化在可用时使用 AVX-512；
- * - 专家 Gate/Up/Down 投影在可用时使用 Intel AMX-INT8；
+ * - Gate/Up 使用融合 AMX；M<=4 的投影切换到 AVX-512BW 专用 kernel；
  * - Top-K、Sigmoid/SwiGLU 和分发保持标量；Down 反量化/加权使用 AVX-512；
  * - 未支持 AVX-512/AMX 的构建自动使用等价标量路径。
  *
@@ -818,8 +1008,17 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                         (size_t)D * sizeof(int8_t));
         }
 
-        matmul_packed(g_amx_A, g_packed_gate[e], g_gate_out, count, D, H);
-        matmul_packed(g_amx_A, g_packed_up[e], g_up_out, count, D, H);
+        const size_t expert_elems = (size_t)D * H;
+        const int8_t* w_gate_e = w.w_gate + (size_t)e * expert_elems;
+        const int8_t* w_up_e = w.w_up + (size_t)e * expert_elems;
+        const int8_t* w_down_e = w.w_down + (size_t)e * expert_elems;
+
+        matmul_gate_up(
+            g_amx_A,
+            g_packed_gate[e], g_packed_up[e],
+            w_gate_e, w_up_e,
+            g_gate_out, g_up_out,
+            count, D, H);
 
         for (int i = 0; i < count; ++i) {
             const int t = g_expert_token_list[e][i];
@@ -842,8 +1041,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                 quantize_hidden_row(h_row, hq_row, H, max_abs);
         }
 
-        matmul_packed(g_quantized_gated, g_packed_down[e], g_down_out,
-                      count, H, D);
+        matmul_small_m_or_packed(
+            g_quantized_gated, g_packed_down[e], w_down_e,
+            g_down_out, count, H, D);
 
         for (int i = 0; i < count; ++i) {
             const int t = g_expert_token_list[e][i];
