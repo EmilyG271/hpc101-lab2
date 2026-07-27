@@ -1992,11 +1992,17 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             opt_threads = (num_procs < 8) ? num_procs : 8;
         } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
             opt_threads = (num_procs < 8) ? num_procs : 8;
-       } else {
-            // N < 64: keep the OMP thread pool warm so that the
-            // single-token parallel expert path (S1: 5 threads,
-            // S2: 15 threads) doesn't pay full fork/join cost every call.
-            opt_threads = (num_procs < 16) ? num_procs : 16;
+        } else {
+            // N < 64: pre-size the OMP pool for the single-token path.
+            // S2 split (D>=1024,H>=512) uses exactly 15 threads; a 16th
+            // idle thread causes measurable cache contention, so size to 15.
+            // S1 uses K+1 threads but a larger pool (16) keeps threads warm
+            // between calls, reducing fork/join wake-up latency.
+            if (D >= 1024 && H >= 512) {
+                opt_threads = 15;
+            } else {
+                opt_threads = (num_procs < 16) ? num_procs : 16;
+            }
         }
         omp_set_num_threads(opt_threads);
     }
