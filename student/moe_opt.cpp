@@ -1281,17 +1281,17 @@ static inline void s2_gate_up_range(
     const int32_t* sum_gate, const int32_t* sum_up, int32_t* gate_out,
     int32_t* up_out, int begin, int end) {
     const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
-    for (int n0 = begin; n0 < end; n0 += 8) {
-        __m512i gate_acc[8];
-        __m512i up_acc[8];
-        for (int j = 0; j < 8; ++j) {
+    for (int n0 = begin; n0 < end; n0 += 4) {
+        __m512i gate_acc[4];
+        __m512i up_acc[4];
+        for (int j = 0; j < 4; ++j) {
             gate_acc[j] = _mm512_setzero_si512();
             up_acc[j] = _mm512_setzero_si512();
         }
         for (int k0 = 0; k0 < 1024; k0 += 64) {
             const __m512i a_u8 = _mm512_xor_si512(
                 _mm512_loadu_si512(xq + k0), sign_flip);
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < 4; ++j) {
                 const __m512i wg = _mm512_loadu_si512(
                     w_gate + (size_t)(n0 + j) * 1024 + k0);
                 const __m512i wu = _mm512_loadu_si512(
@@ -1300,7 +1300,7 @@ static inline void s2_gate_up_range(
                 up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
             }
         }
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < 4; ++j) {
             gate_out[n0 + j] = _mm512_reduce_add_epi32(gate_acc[j]) -
                                128 * sum_gate[n0 + j];
             up_out[n0 + j] = _mm512_reduce_add_epi32(up_acc[j]) -
