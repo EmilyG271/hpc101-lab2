@@ -1547,7 +1547,6 @@ static inline void s1_exec_task(
 }
 
 struct S1Worker {
-    std::atomic<uint32_t> epoch{0};
     std::atomic<uint32_t> done{0};
     ExpertScratch scratch;
     const MoEWeights* w;
@@ -1559,6 +1558,7 @@ struct S1Worker {
 static S1Worker g_s1_wkrs[MAX_TOP_K];
 static std::thread g_s1_thrds[MAX_TOP_K];
 static int g_s1_pool_sz = 0;
+static std::atomic<uint32_t> g_s1_epoch{0};
 
 static void s1_worker_loop(int wid) {
     S1Worker& wk = g_s1_wkrs[wid];
@@ -1566,9 +1566,9 @@ static void s1_worker_loop(int wid) {
         wk.scratch.amx_perm = request_amx_permission();
     uint32_t seen = 0;
     for (;;) {
-        while (wk.epoch.load(std::memory_order_acquire) == seen)
+        while (g_s1_epoch.load(std::memory_order_acquire) == seen)
             _mm_pause();
-        seen = wk.epoch.load(std::memory_order_acquire);
+        seen = g_s1_epoch.load(std::memory_order_acquire);
         if (seen == 0xFFFFFFFFu) break;
         wk.scratch.ensure(1, (size_t)wk.D, (size_t)wk.H);
         s1_exec_task(*wk.w, wk.D, wk.H, wk.task,
@@ -1611,8 +1611,8 @@ static void compute_single_token_routed_experts_parallel(
             g_s1_wkrs[i].use_small_gate_up = use_small_gate_up;
             g_s1_wkrs[i].use_small_down = use_small_down;
             g_s1_wkrs[i].y_acc = g_single_yacc[i + 1];
-            g_s1_wkrs[i].epoch.fetch_add(1, std::memory_order_release);
         }
+        g_s1_epoch.fetch_add(1, std::memory_order_release);
 
         if (g_amx_runtime_enabled && !tl_scratch.amx_perm)
             tl_scratch.amx_perm = request_amx_permission();
@@ -1621,7 +1621,7 @@ static void compute_single_token_routed_experts_parallel(
                      tl_scratch, g_single_yacc[0]);
 
         for (int i = 0; i < nworkers; i++) {
-            const uint32_t e = g_s1_wkrs[i].epoch.load(std::memory_order_relaxed);
+            const uint32_t e = g_s1_epoch.load(std::memory_order_relaxed);
             while (g_s1_wkrs[i].done.load(std::memory_order_acquire) != e)
                 _mm_pause();
         }
