@@ -18,6 +18,17 @@
 #include <omp.h>
 #endif
 
+#if defined(_OPENMP) && defined(__linux__)
+// R62: Bind threads to physical cores and pack them close together
+// to improve L2/L3 locality for weight-streaming kernels.
+__attribute__((constructor))
+static void tune_omp_affinity() {
+    setenv("OMP_PROC_BIND", "close", 0);
+    setenv("OMP_PLACES", "cores", 0);
+}
+#endif
+
+
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__) && defined(__linux__)
 #include <sys/syscall.h>
 #include <unistd.h>
