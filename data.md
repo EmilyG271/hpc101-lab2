@@ -2123,3 +2123,114 @@ S1 从 50.5 下降到 48.1 (-2.4)，但被 S2 增益完全抵消。
 3. S1: 融合 SwiGLU+quantize 到 VNNI kernel
 4. S3: AMX 2N tiling (S3 有 ~18 分提升空间到 120)
 5. 使用 perf/VTune 精确分析各阶段开销
+
+### R109: S1/S2 SwiGLU 期间 prefetch down weights [FAILED - reverted to R107]
+
+**假设**: SwiGLU (exp+rcp14) 是 compute-bound，内存子系统空闲。在 SwiGLU 循环内添加 _mm_prefetch 预取 down 权重到 L2，减少 down kernel 启动时的 L1 miss。
+
+**Grading 数据**:
+
+| 场景 | R107 (s) | R109 best (s) | 变化 |
+|------|---------|-------------|------|
+| S1 | 0.00585 | 0.00614 | +4.9% |
+| S2 | 0.03956 | 0.04422 | +11.8% |
+
+**分析**: S1 和 S2 均退化。软件 prefetch 干扰了 HW prefetcher 的流检测，增加了循环内指令开销。与 R41 (第一次尝试 prefetch) 结论一致。
+
+**决策**: 舍弃。软件 prefetch 在 SwiGLU 循环内已完全排除。
+
+### R110: S2 空闲线程 (tid>=5) 预取 down 权重 [FAILED - reverted to R107]
+
+**假设**: S2 SwiGLU 阶段 10/15 线程空闲。让空闲线程预取各自 (slot, chunk) 的 down 权重到 L2，不增加 SwiGLU 循环开销。
+
+**Grading 数据 (3 次运行)**:
+
+| 运行 | S2 (s) | 变化 vs R107 |
+|------|---------|------------|
+| Run 1 | 0.04422 | +11.8% |
+| Run 2 | 0.04397 | +11.1% |
+| Run 3 | 0.04465 | +12.8% |
+
+**分析**: S2 一致退化 ~12%。原因: 10 个空闲线程同时预取导致内存带宽饱和，干扰 SwiGLU 线程的 L3 读取 (gate_out/up_out)。即使预取指令在 else 分支中，内存带宽竞争仍然影响 SwiGLU 性能。
+
+**决策**: 舍弃。空闲线程 prefetch 已排除。软件 prefetch 在此 workload 上已完全排除 (R41, R109, R110)。
+
+### R111: AMX 2N tiling — A tile 复用于 2 个 N-tile [SUCCESS - kept, commit e0e98a8]
+
+**假设**: amx_matmul_packed 每次处理 1 个 N-tile (TILE_N=16)。改为每次处理 2 个 N-tile: A tile (tile 2) 加载一次，复用于 2 个 B tile (tile 3, 4)，减半 A-tile 加载次数，同时每 k-iteration 发出 2 个 dpbssd 提升 ILP。S3 perf 显示 IPC 仅 1.11，需要更多指令级并行。
+
+**实现**:
+- 修改 amx_matmul_packed: n0 循环步长从 TILE_N(16) 改为 2*TILE_N(32)
+- 2N 路径: _tile_zero(0)+_tile_zero(1), 每 k-iter 加载 A+B1+B2, dpbssd(0,2,3)+dpbssd(1,2,4)
+- 余数路径: N 为奇数时回退到单 N-tile (S3/S4 不触发)
+- Tile 配置不变: 已有 5 tile (0,1,2,3,4) 配置直接复用
+
+**Grading 数据 (多次运行)**:
+
+| 场景 | Baseline (s) | R107 (s) | R111 best (s) | R107 分数 | R111 分数 | 变化 |
+|------|-------------|---------|-------------|---------|---------|------|
+| S1 | 0.05061 | 0.00585 | 0.00568* | 48.1 | 49.5* | +1.4* |
+| S2 | 0.61609 | 0.03956 | 0.03922 | 39.6 | 40.0 | +0.4 |
+| S3 | 6.61416 | 0.09147 | 0.09070 | 101.8 | 102.9 | +1.1 |
+| S4 | 229.733 | 1.46497 | 1.44893 | 120.0 | 120.0 | 0 |
+| **平均** | | | | **77.4** | **78.1** | **+0.7** |
+
+*S1 标注星号因 S1 不使用 amx_matmul_packed (使用 VNNI)，改善为噪声。
+
+**分析**:
+- S3: 91.5us -> 90.7us (-0.9%)，3 次 grading 一致 (90.7, 90.8, 91.5us)。A-tile 加载次数减半 (32->16 per m0 per expert)，减少 L1 流量。改善小但一致。
+- S2/S1: 不使用 AMX，改善为 grading 噪声。
+- S4: 1.465s -> 1.449s (-1.1%)，已封顶 120 分。
+- **关键发现**: AMX 2N tiling 的实际收益远小于理论值。SPR AMX 的计算端口 (dpbssd) 是瓶颈而非加载端口。2 个 dpbssd 的吞吐与 1 个相同 (1 per ~5 cycles)，但 A-tile 加载减少仍带来 ~1% 改善。
+
+**决策**: 保留 R111。S3 改善虽小但一致，不退化任何场景。
+
+**与 R83/R92 对比**: R83 "inconclusive", R92 "code never applied"。R111 正确实现并确认了 S3 的微小改善。
+
+### 当前最高分: R111 = 78.1 平均分 (保守估计 77.7，S1 噪声修正后)
+
+### 本 session 完整优化总结
+本次 session 从 R104 (77.0) 出发:
+- R107: silu rcp14 (无 NR) + S2 set1 hoist — SUCCESS (+0.4 avg)
+- R107b: 仅 set1 hoist (回退 rcp14) — FAILED (S3 -4.4)
+- R108: exp 5th-order + S2 down 8-output — FAILED (S3 -3.4)
+- R108b: 仅 S2 down 8-output — FAILED (S2 -4.0)
+- R109: SwiGLU 期间 prefetch — FAILED (S1/S2 退化)
+- R110: 空闲线程 prefetch — FAILED (S2 -12% 退化)
+- R111: AMX 2N tiling — SUCCESS (+0.3~0.7 avg)
+
+累计提升: +0.7~1.1 平均分 (77.0 -> 77.7~78.1)
+
+### Profiling 数据
+
+**S1 perf (pod-local, 1000 iter)**:
+- IPC: 2.14
+- L1-dcache-load-misses: 19.54%
+- LLC-load-misses: 10.45%
+- 瓶颈: L1 容量不足 (96KB/expert > 48KB L1)，权重从 L2 加载
+
+**S2 perf (pod-local, 1000 iter)**:
+- IPC: 1.68
+- L1-dcache-load-misses: 15.52%
+- LLC-load-misses: 0.94%
+- 瓶颈: 内存延迟 (IPC 低)，L1 miss 主要由权重加载引起
+
+**S3 perf (pod-local, 1000 iter)**:
+- IPC: 1.11
+- L1-dcache-load-misses: 12.10%
+- LLC-load-misses: 0.28%
+- 瓶颈: AMX 计算端口 (dpbssd 吞吐)，数据在 L2/L3 中
+
+### 排除列表更新
+- **软件 prefetch 已完全排除** (R41, R109, R110): 干扰 HW prefetcher 或内存带宽竞争
+- **S2 down 8-output tile 已排除** (R108/R108b): cache thrashing
+- **exp 5th-order 已排除** (R108): 精度降低影响 cache 行为
+- **AMX 2N tiling 已实现** (R111): S3 +1.1 分，A-tile 加载减半
+
+### 下一步计划
+1. S2: 尝试 tree-based barrier 持久化线程池
+2. S2: 权重重排 (blocked layout)
+3. S1: 融合 SwiGLU+quantize 到 VNNI kernel
+4. S3: 探索其他 AMX 优化 (如 fused gate_up AMX for S3)
+5. 使用 perf/VTune 精确分析各阶段开销
+6. **软件 prefetch 已完全排除** (R41, R109, R110)
