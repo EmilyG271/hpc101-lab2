@@ -183,6 +183,23 @@ static thread_local ExpertScratch tl_scratch;
 // 小批量保持串行，避免 OpenMP 团队创建/调度开销影响 S1、S2。
 static constexpr int OMP_TOKEN_THRESHOLD = 64;
 
+// R95: Custom horizontal sum of 16 int32 lanes via VPADDD (lat 1) + PSHUFD,
+// replacing _mm512_reduce_add_epi32 which uses PHADDD (lat 7, tput 0.5).
+// Lower latency lets compiler overlap reduction with next iteration's VPDPBUSDs.
+static inline int32_t zmm_hsum_i32(__m512i v) {
+    __m256i lo = _mm512_castsi512_si256(v);
+    __m256i hi = _mm512_extracti32x8_epi32(v, 1);
+    __m256i s1 = _mm256_add_epi32(lo, hi);
+    __m128i s2 = _mm256_castsi256_si128(s1);
+    __m128i s3 = _mm256_extracti128_si256(s1, 1);
+    __m128i s4 = _mm_add_epi32(s2, s3);
+    __m128i s5 = _mm_shuffle_epi32(s4, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128i s6 = _mm_add_epi32(s4, s5);
+    __m128i s7 = _mm_shuffle_epi32(s6, _MM_SHUFFLE(1, 0, 3, 2));
+    __m128i s8 = _mm_add_epi32(s6, s7);
+    return _mm_cvtsi128_si32(s8);
+}
+
 /**
  * @brief 将框架的输出通道优先 INT8 权重转置并打包为 AMX TDPBSSD 所需布局。
  *
@@ -731,12 +748,12 @@ static void small_m_gate_up_output_major(
                     up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
                 }
             }
-            for (int j = 0; j < 2; ++j) {
-                C_gate[n0 + j] =
-                    _mm512_reduce_add_epi32(gate_acc[j]) - 128 * sum_gate[n0 + j];
-                C_up[n0 + j] =
-                    _mm512_reduce_add_epi32(up_acc[j]) - 128 * sum_up[n0 + j];
-            }
+           for (int j = 0; j < 2; ++j) {
+               C_gate[n0 + j] =
+                   zmm_hsum_i32(gate_acc[j]) - 128 * sum_gate[n0 + j];
+               C_up[n0 + j] =
+                   zmm_hsum_i32(up_acc[j]) - 128 * sum_up[n0 + j];
+           }
         }
         return;
     }
@@ -774,10 +791,10 @@ static void small_m_gate_up_output_major(
             }
 
             for (int j = 0; j < 4; ++j) {
-                C_gate[(size_t)m * N + n0 + j] =
-                    _mm512_reduce_add_epi32(gate_acc[j]);
-                C_up[(size_t)m * N + n0 + j] =
-                    _mm512_reduce_add_epi32(up_acc[j]);
+               C_gate[(size_t)m * N + n0 + j] =
+                   zmm_hsum_i32(gate_acc[j]);
+               C_up[(size_t)m * N + n0 + j] =
+                   zmm_hsum_i32(up_acc[j]);
             }
         }
     }
@@ -817,11 +834,11 @@ static void small_m_matmul_output_major(
                 }
             }
             for (int j = 0; j < 8; ++j) {
-                C[n0 + j] =
-                    _mm512_reduce_add_epi32(acc[j]) - 128 * row_sums[n0 + j];
-            }
-        }
-        return;
+               C[n0 + j] =
+                   zmm_hsum_i32(acc[j]) - 128 * row_sums[n0 + j];
+           }
+       }
+       return;
     }
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -847,8 +864,8 @@ static void small_m_matmul_output_major(
             }
 
             for (int j = 0; j < 4; ++j) {
-                C[(size_t)m * N + n0 + j] =
-                    _mm512_reduce_add_epi32(acc[j]);
+               C[(size_t)m * N + n0 + j] =
+                   zmm_hsum_i32(acc[j]);
             }
         }
     }
@@ -1311,12 +1328,12 @@ static inline void s2_gate_up_range(
                 up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
             }
         }
-        for (int j = 0; j < 4; ++j) {
-            gate_out[n0 + j] = _mm512_reduce_add_epi32(gate_acc[j]) -
-                               128 * sum_gate[n0 + j];
-            up_out[n0 + j] = _mm512_reduce_add_epi32(up_acc[j]) -
-                             128 * sum_up[n0 + j];
-        }
+       for (int j = 0; j < 4; ++j) {
+           gate_out[n0 + j] = _mm512_reduce_add_epi32(gate_acc[j]) -
+                              128 * sum_gate[n0 + j];
+           up_out[n0 + j] = _mm512_reduce_add_epi32(up_acc[j]) -
+                            128 * sum_up[n0 + j];
+       }
     }
 }
 
@@ -1336,10 +1353,10 @@ static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
                 acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
             }
         }
-        for (int j = 0; j < 4; ++j) {
-            down_out[n0 + j] = _mm512_reduce_add_epi32(acc[j]) -
-                                128 * row_sums[n0 + j];
-        }
+       for (int j = 0; j < 4; ++j) {
+           down_out[n0 + j] = _mm512_reduce_add_epi32(acc[j]) -
+                               128 * row_sums[n0 + j];
+       }
     }
 }
 
