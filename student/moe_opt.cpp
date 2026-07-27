@@ -687,6 +687,9 @@ static constexpr size_t SMALL_M_WORK_THRESHOLD = 262144;
 static constexpr bool USE_FUSED_GATE_UP_AMX = true;
 
 static inline bool should_use_small_m_kernel(int M, int K, int N) {
+#if defined(__AVX512VNNI__)
+    if (M == 1) return true;
+#endif
     return M <= SMALL_M_THRESHOLD &&
            (size_t)K * (size_t)N >= SMALL_M_WORK_THRESHOLD;
 }
