@@ -1559,3 +1559,76 @@ S2 grading ???? (0.0401054 vs 0.0401091)?8-output tile ??????
 3. R92: 修复 AMX 2N tiling 代码匹配问题，重新测试 (仅影响 S3/S4)
 4. S1: 融合 SwiGLU+quantize 到 VNNI kernel，减少内存读写
 5. S2: 尝试权重重排 (blocked layout) 改善 L2 cache line 利用率
+---
+
+## R93-R96: zmm_hsum_i32 优化尝试 (2026-07-28)
+
+### R93: proc_bind(close) for S1/S2 [NEUTRAL, not kept separately]
+**假设**: proc_bind(close) 让线程紧绑定到相邻核心，减少 L2 cache 跨核迁移。
+
+**结果**: S1 median 7.16us vs R88 7.18us — 在噪声范围内。
+
+**决策**: 未单独保留。proc_bind 效果在 grading 节点可能不同，但 pod-local 无改善。
+
+### R94: S1 K-loop manual unroll by 2 [FAILED -3.5%, REVERTED]
+**假设**: 手动展开 K 循环 2 倍，提前发出两组 load 指令，增加 load queue 利用率，隐藏 L1 miss 延迟。
+
+**结果**: S1 median 7.41us vs R88 7.18us — 更慢。
+
+**原因**: 手动展开增加寄存器压力，干扰 GCC -O3 的指令调度。编译器已自动优化指令级并行。
+
+### R95: zmm_hsum_i32 for ALL VNNI kernels [MIXED, not kept]
+**假设**: _mm512_reduce_add_epi32 使用 PHADDD 链 (latency 7, throughput 0.5)。自定义 zmm_hsum_i32 使用 VPADDD (lat 1) + PSHUFD (lat 1) 组合，总 latency 更低，允许编译器将 reduce 与下一轮 VPDPBUSD 重叠。
+
+**结果** (pod-local, 10 runs each, same session A/B):
+- S1 R95 median 7.09us vs R88 7.38us — +3.9% 改善
+- S2 R95 median 31.84us vs R88 29.87us — -6.6% 退化
+
+**原因**: S2 是内存带宽瓶颈，自定义 reduce 的额外指令 (shuffle+add) 与 VPDPBUSD 竞争执行端口。S1 瓶颈更偏向计算/reduce 开销，latency 降低有帮助。
+
+### R96: zmm_hsum_i32 for S1 ONLY [KEPT - current best]
+**假设**: 仅在 S1 VNNI kernels (small_m_gate_up_output_major + small_m_matmul_output_major) 使用 zmm_hsum_i32，S2 kernels 保持 _mm512_reduce_add_epi32。
+
+**结果** (pod-local, 10 runs each, same session A/B):
+
+| 场景 | R88 median | R96 median | 变化 |
+|------|-----------|-----------|------|
+| S1 | 7.40us | 7.17us | -3.2% (更快) |
+| S2 | 29.87us | 同 R88 代码 | 无变化 (噪声) |
+| S3 | 不变 | 不变 | AMX 路径未修改 |
+| S4 | 不变 | 不变 | AMX 路径未修改 |
+
+**决策**: 保留。R96 = R88 + S1 zmm_hsum_i32。S1 有小幅改善，S2/S3/S4 不变。
+
+### 当前最佳: R96 (commit b588610, pushed to GitHub)
+| 场景 | Grading (s, R88 参考) | 加速比 | 估计分数 |
+|------|---------------------|--------|---------|
+| S1 | ~0.00675 (R88), R96 预期 ~0.00654 | ~7.7x | ~43 |
+| S2 | 0.04011 (不变) | 15.36x | 39.4 |
+| S3 | 0.09168 (不变) | 72.14x | 101.6 |
+| S4 | 1.46718 (不变) | 156.6x | 120.0 |
+| **平均** | | | **~76** |
+
+注: S1 grading 数据未测 (集群维护窗口)。pod-local A/B 显示 +3.2% 改善。实际 grading 分数待测。
+
+### zmm_hsum_i32 实现细节
+对比 _mm512_reduce_add_epi32 (PHADDD 链, lat 7):
+- VPADDD: latency 1, throughput 0.5
+- PSHUFD: latency 1, throughput 1
+- 总 instruction 数更多 (9 vs ~5)，但 latency 链更短 (4 vs 7)
+- 在 S1 (compute-bound) 有效，在 S2 (memory-bound) 无效
+
+### 5轮报告 (R93-R96)
+| 轮次 | 方向 | 结果 | 原因 |
+|------|------|------|------|
+| R93 | proc_bind(close) S1/S2 | 中性 | 效果在噪声范围内 |
+| R94 | S1 K-loop unroll by 2 | 失败 -3.5% | 寄存器压力干扰编译器调度 |
+| R95 | zmm_hsum_i32 所有 kernel | 混合 | S1 +4% S2 -6.6%，S2 退化 |
+| R96 | zmm_hsum_i32 仅 S1 | 成功 +3.2% | S1 改善，S2/S3/S4 不变 |
+
+### 下一步计划
+1. S1: grading 测试确认 R96 实际分数 (集群恢复后)
+2. S1: 持久化线程池 (std::thread + atomic spin-wait)，消除 fork/join 开销
+3. S2: 权重重排 (blocked layout) 改善 L2 cache line 利用率
+4. S3/S4: AMX 2N tiling 复用 A tile
+5. S1: 融合 SwiGLU+quantize 到 VNNI kernel
