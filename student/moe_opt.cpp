@@ -1267,6 +1267,154 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
 // 复用 R5 的 thread_local ExpertScratch 与 AMX 权限缓存。
 #if defined(_OPENMP)
 alignas(64) static float g_single_yacc[MAX_TOP_K + 1][MAX_D_MODEL];
+
+#if defined(__AVX512VNNI__)
+alignas(64) static int32_t g_s2_gate[5][MAX_D_FF];
+alignas(64) static int32_t g_s2_up[5][MAX_D_FF];
+alignas(64) static float g_s2_hidden[5][MAX_D_FF];
+alignas(64) static int8_t g_s2_hidden_q[5][MAX_D_FF];
+static float g_s2_hidden_scale[5];
+alignas(64) static int32_t g_s2_down[5][MAX_D_MODEL];
+
+static void s2_gate_up_range(const int8_t* xq, const int8_t* w_gate,
+                             const int8_t* w_up, const int32_t* sum_gate,
+                             const int32_t* sum_up, int32_t* gate_out,
+                             int32_t* up_out, int D, int begin, int end) {
+    const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+    for (int n0 = begin; n0 < end; n0 += 8) {
+        __m512i gate_acc[8];
+        __m512i up_acc[8];
+        for (int j = 0; j < 8; ++j) {
+            gate_acc[j] = _mm512_setzero_si512();
+            up_acc[j] = _mm512_setzero_si512();
+        }
+        for (int k0 = 0; k0 < D; k0 += 64) {
+            const __m512i a_u8 = _mm512_xor_si512(
+                _mm512_loadu_si512(xq + k0), sign_flip);
+            for (int j = 0; j < 8; ++j) {
+                const __m512i wg = _mm512_loadu_si512(
+                    w_gate + (size_t)(n0 + j) * D + k0);
+                const __m512i wu = _mm512_loadu_si512(
+                    w_up + (size_t)(n0 + j) * D + k0);
+                gate_acc[j] = _mm512_dpbusd_epi32(gate_acc[j], a_u8, wg);
+                up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
+            }
+        }
+        for (int j = 0; j < 8; ++j) {
+            gate_out[n0 + j] = _mm512_reduce_add_epi32(gate_acc[j]) -
+                               128 * sum_gate[n0 + j];
+            up_out[n0 + j] = _mm512_reduce_add_epi32(up_acc[j]) -
+                             128 * sum_up[n0 + j];
+        }
+    }
+}
+
+static void s2_down_range(const int8_t* hq, const int8_t* w_down,
+                          const int32_t* row_sums, int32_t* down_out,
+                          int H, int begin, int end) {
+    const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+    for (int n0 = begin; n0 < end; n0 += 8) {
+        __m512i acc[8];
+        for (int j = 0; j < 8; ++j) acc[j] = _mm512_setzero_si512();
+        for (int k0 = 0; k0 < H; k0 += 64) {
+            const __m512i a_u8 = _mm512_xor_si512(
+                _mm512_loadu_si512(hq + k0), sign_flip);
+            for (int j = 0; j < 8; ++j) {
+                const __m512i wv = _mm512_loadu_si512(
+                    w_down + (size_t)(n0 + j) * H + k0);
+                acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
+            }
+        }
+        for (int j = 0; j < 8; ++j) {
+            down_out[n0 + j] = _mm512_reduce_add_epi32(acc[j]) -
+                                128 * row_sums[n0 + j];
+        }
+    }
+}
+
+static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
+                                          float* y, int D, int H, int K) {
+    constexpr int NUM_EXPERTS = 5;
+    constexpr int NUM_THREADS = 10;
+    if (D != 1024 || H != 512 || K != 4 || omp_get_num_procs() < NUM_THREADS)
+        return false;
+
+    const size_t expert_elems = (size_t)D * H;
+    const int8_t* gate_w[NUM_EXPERTS] = {w.sh_gate};
+    const int8_t* up_w[NUM_EXPERTS] = {w.sh_up};
+    const int8_t* down_w[NUM_EXPERTS] = {w.sh_down};
+    const int32_t* gate_sum[NUM_EXPERTS] = {g_sum_shared_gate};
+    const int32_t* up_sum[NUM_EXPERTS] = {g_sum_shared_up};
+    const int32_t* down_sum[NUM_EXPERTS] = {g_sum_shared_down};
+    float gate_scale[NUM_EXPERTS] = {g_scale_shared_gate};
+    float up_scale[NUM_EXPERTS] = {g_scale_shared_up};
+    float down_scale[NUM_EXPERTS] = {g_scale_shared_down};
+    float route_scale[NUM_EXPERTS] = {1.0f};
+    for (int slot = 1; slot < NUM_EXPERTS; ++slot) {
+        const int e = g_topk_indices[0][slot - 1];
+        gate_w[slot] = w.w_gate + (size_t)e * expert_elems;
+        up_w[slot] = w.w_up + (size_t)e * expert_elems;
+        down_w[slot] = w.w_down + (size_t)e * expert_elems;
+        gate_sum[slot] = g_sum_gate[e];
+        up_sum[slot] = g_sum_up[e];
+        down_sum[slot] = g_sum_down[e];
+        gate_scale[slot] = g_scale_gate[e];
+        up_scale[slot] = g_scale_up[e];
+        down_scale[slot] = g_scale_down[e];
+        route_scale[slot] = g_topk_weights[0][slot - 1];
+    }
+
+    const int8_t* xq = g_quantized_x;
+    const float x_scale = g_x_scale[0];
+#pragma omp parallel num_threads(NUM_THREADS)
+    {
+        const int tid = omp_get_thread_num();
+        const int slot = tid >> 1;
+        const int half = tid & 1;
+        s2_gate_up_range(xq, gate_w[slot], up_w[slot], gate_sum[slot],
+                         up_sum[slot], g_s2_gate[slot], g_s2_up[slot], D,
+                         half * (H / 2), (half + 1) * (H / 2));
+#pragma omp barrier
+        if (tid < NUM_EXPERTS) {
+            float max_abs = 0.0f;
+            const __m512 sg = _mm512_set1_ps(gate_scale[tid] * x_scale);
+            const __m512 su = _mm512_set1_ps(up_scale[tid] * x_scale);
+            __m512 vmax = _mm512_setzero_ps();
+            for (int h = 0; h < H; h += 16) {
+                const __m512 gate = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_loadu_si512(g_s2_gate[tid] + h)), sg);
+                const __m512 up = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_loadu_si512(g_s2_up[tid] + h)), su);
+                const __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+                _mm512_storeu_ps(g_s2_hidden[tid] + h, value);
+                vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(
+                    _mm512_set1_ps(-0.0f), value));
+            }
+            max_abs = _mm512_reduce_max_ps(vmax);
+            g_s2_hidden_scale[tid] = quantize_hidden_row(
+                g_s2_hidden[tid], g_s2_hidden_q[tid], H, max_abs);
+        }
+#pragma omp barrier
+        s2_down_range(g_s2_hidden_q[slot], down_w[slot], down_sum[slot],
+                      g_s2_down[slot], H, half * (D / 2),
+                      (half + 1) * (D / 2));
+    }
+
+    for (int d = 0; d < D; d += 16) {
+        __m512 acc = _mm512_loadu_ps(x + d);
+        for (int slot = 0; slot < NUM_EXPERTS; ++slot) {
+            const __m512 dequant = _mm512_set1_ps(
+                g_s2_hidden_scale[slot] * down_scale[slot] * route_scale[slot]);
+            acc = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_loadu_si512(g_s2_down[slot] + d)),
+                dequant, acc);
+        }
+        _mm512_storeu_ps(y + d, acc);
+    }
+    return true;
+}
+#endif
+
 static void compute_single_token_routed_experts_parallel(
     const float* x, const MoEWeights& w, float* y,
     int D, int H, int K, int nthreads) {
@@ -1881,6 +2029,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 
 #if defined(_OPENMP)
     if (num_tokens == 1) {
+#if defined(__AVX512VNNI__)
+        if (compute_single_token_s2_split(x, w, y, D, H, K)) return;
+#endif
         int k_threads = K + 1;
         const int np = omp_get_num_procs();
         if (k_threads > np) k_threads = np;
