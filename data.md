@@ -2234,3 +2234,54 @@ S1 从 50.5 下降到 48.1 (-2.4)，但被 S2 增益完全抵消。
 4. S3: 探索其他 AMX 优化 (如 fused gate_up AMX for S3)
 5. 使用 perf/VTune 精确分析各阶段开销
 6. **软件 prefetch 已完全排除** (R41, R109, R110)
+---
+
+## 会话结束 (2026-07-28, 集群维护)
+
+集群即将进入维护状态，按用户指示结束本次优化会话。当前最佳版本 R111 已确认上传至 GitHub。
+
+### 最终状态确认
+- **当前最佳**: R111 (commit `e0e98a8` 代码 / `6c24992` data.md)
+- **GitHub**: `git@github.com:EmilyG271/hpc101-lab2.git` origin/main = `6c24992` (已同步)
+- **集群**: `~/hpc101-lab2/` HEAD = `6c24992`，工作树 moe_opt.cpp 干净 (R111)
+- **本地**: `D:\09_HPC\HPC_Learning\Lab2\HPC101-src\lab2\student\moe_opt.cpp` (R111, 与集群一致)
+
+### R111 最终成绩 (grading, best-of-runs)
+| 场景 | Opt (s) | 加速比 | 估计分数 |
+|------|---------|--------|---------|
+| S1 | 0.00568 | 8.91× | ~49.5 |
+| S2 | 0.03922 | 15.71× | ~40.0 |
+| S3 | 0.09070 | 72.9× | ~102.9 |
+| S4 | 1.44893 | 158.7× | 120.0 |
+| **平均** | | | **~78.1** |
+
+### 本次会话总结
+从 R104 (77.0 平均分) 出发，本次会话共尝试 6 轮优化:
+- **R107** (silu rcp14 + S2 set1 hoist) — SUCCESS, +0.4
+- **R107b** (仅 set1 hoist) — FAILED, S3 -4.7
+- **R108** (exp 5th-order + S2 down 8-output) — FAILED, S3 -3.4
+- **R108b** (仅 S2 down 8-output) — FAILED, S2 -4.0
+- **R109** (SwiGLU 期间 prefetch) — FAILED, S1/S2 退化
+- **R110** (空闲线程 prefetch) — FAILED, S2 -12%
+- **R111** (AMX 2N tiling) — SUCCESS, +0.3~0.7
+
+累计提升: 77.0 → 78.1 平均分 (+1.1)
+
+### 复用优先 (下次恢复时不要重复尝试)
+本次会话已彻底排除的方向:
+- **软件 prefetch** (R41/R109/R110): 干扰 HW prefetcher 或饱和内存带宽
+- **S2 down 8-output tile** (R108/R108b): L1 cache 关联性冲突导致 thrashing
+- **exp 5th-order 近似** (R108): 精度变化影响 INT8 量化与 AMX cache 行为
+- **回退 silu rcp14** (R107b): rcp14 对 S3 (大量 silu 调用) 收益大于对 S1 的扰动
+
+### 下次恢复优先方向
+1. **S2 tree-based barrier 持久化线程池** — 用 O(log N) 屏障替代 3-phase O(N) 同步，可能匹配 OMP barrier 同时消除 fork/join 开销
+2. **S1 融合 SwiGLU+quantize 到 VNNI kernel** — 减少内存流量 (S1 瓶颈为 L1 容量)
+3. **S3 fused gate_up AMX** — 已有 `amx_matmul_gate_up_packed()` 未启用，S3 M≈8-16 可能受益
+4. **S2 权重重排 (blocked layout)** — 提升 L2 cache line 利用率
+5. 用 perf/VTune 精确分析 S1 store/reduce 与 S2 内存延迟开销
+
+### 瓶颈画像 (profiling, pod-local 1000 iter)
+- **S1**: IPC=2.14, L1-miss=19.5%, LLC-miss=10.5% — 瓶颈: L1 容量 (96KB/expert > 48KB L1)
+- **S2**: IPC=1.68, L1-miss=15.5%, LLC-miss=0.9% — 瓶颈: 内存延迟
+- **S3**: IPC=1.11, L1-miss=12.1%, LLC-miss=0.3% — 瓶颈: AMX 计算端口 (dpbssd 吞吐)
