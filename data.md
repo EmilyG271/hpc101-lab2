@@ -1264,3 +1264,70 @@ S1/S2/S3 各自瓶颈总结:
 4. S3 gather: 尝试按 K 维分块 gather, 减少 A buffer 大小
 5. S1: 持久线程池 (消除 fork/join), 收益预估 ~7%
 6. 低负载环境重测 R83 (2N tiling), 可能被噪声淹没的实际收益
+
+---
+
+## R85: S1 N-split across 8 threads (2026-07-28)
+
+### 优化假设
+S1 是 87% L1-miss-bound (每专家 96KB 权重 vs 48KB L1)。N-split 跨 8 线程, 每线程仅处理 H/8=16 或 D/8=32 输出维度, 使每线程权重足迹降至 ~40KB (gate_up 阶段) / ~20KB (down 阶段), 均 < 48KB L1。
+
+### 设计
+- 新增 s1_gate_up_range (2-output VNNI, K=256 硬编码) 和 s1_down_range (8-output VNNI, K=128 硬编码)
+- 新增 compute_single_token_s1_nsplit: 8 线程, 2 barriers, 复用 g_s2_* 静态缓冲区
+- Phase 1: 8 线程并行计算所有 5 专家的 gate_up (各自 H-slice)
+- Barrier 1 -> Phase 2: 5 线程做 SwiGLU+quantize
+- Barrier 2 -> Phase 3: 8 线程并行计算所有 5 专家的 down (各自 D-slice)
+- 最终串行归约
+
+### A/B 测试 (pod-local, 10 runs each, taskset -c 0-15)
+| 版本 | 最小(s) | 中位数(s) | 最大(s) |
+|------|---------|-----------|---------|
+| R62  | 0.00644 | 0.00719   | 0.00772 |
+| R85  | 0.00748 | 0.00774   | 0.00812 (排除 2 个冷启动异常值) |
+
+### 结果: 回退 (-7.6%)
+R85 中位数 0.00774s vs R62 中位数 0.00719s, 慢 7.6%。
+
+### 失败原因分析
+1. **Barrier 开销主导**: S1 运行时间仅 ~7us, 2 个 barrier + fork/join 约 0.5-1us, 占 7-14%
+2. **L1 收益不足**: 虽然每线程权重足迹降至 40KB < 48KB L1, 但 SPR 有 12 MSHRs/core, 原设计 4 并发 miss 已有足够 MLP 隐藏延迟
+3. **确认模式**: 所有基于 barrier 的 S1 尝试均失败 (R71, R72, R80, R85)。S1 运行时间太短 (~7us), 无法摊销 barrier 开销
+4. **冷启动效应**: 首次运行出现 0.052s 异常值 (接近 baseline 0.0506s), 需排除
+
+### 关键发现
+- Pod-local R62 S1 中位数 0.00719s (10 runs), 评分节点 0.00769s 在 pod-local 高端
+- 首次编译后运行会出现冷缓存异常值, 必须排除
+- 需要 10+ 次运行取中位数才能得到可靠对比
+
+### 动作: 回退至 R62 (commit f858f42)
+
+---
+
+## 本轮会话总结 (R85)
+
+当前最佳版本: R62 (commit f858f42) -- 未变
+
+R62 评分结果 (未变):
+| 场景 | 评分时间(s) | 加速比 | 评分分数 |
+|------|------------|--------|---------|
+| S1 | 0.00769 | 6.58x | 36.6 |
+| S2 | 0.03739 | 16.48x | 42.3 |
+| S3 | 0.09697 | 68.21x | 96.1 |
+| S4 | 1.46030 | 157.31x | 120.0 |
+| **平均** | | | **73.7** |
+
+本轮尝试 R85 共 1 轮优化, 失败回退。
+
+R85 结论: S1 N-split (8 线程, 2 barriers) 慢 7.6%。S1 运行时间太短 (~7us), barrier 开销无法被 L1 缓存改进抵消。这与 R71/R72/R80 的失败一致。
+
+S1/S2 优化空间已接近极限:
+- S1: 无 barrier 方案仅能使用 K+1=5 线程 (每专家 1 线程), VNNI output 块数已调优 (gate_up=2, down=8)
+- S2: 3-chunk/15-thread 甜蜜点, "空闲线程" cache keeper 不可移除
+- 所有 S1 barrier-based 方案均因运行时间太短而失败
+
+下一步计划 (如果集群恢复):
+1. S3 AMX: 尝试增大 TILE_N (16->32)
+2. S3 AMX: 尝试 3N tiling (7 tiles)
+3. S1: 持久线程池 (std::thread + atomic spin-wait), 消除 fork/join
+4. 低负载环境重测 R83 (2N tiling)
