@@ -1644,3 +1644,77 @@ R96 实际 S1 改善 vs R88 (同 session): +4.3%。
 3. S2: 权重重排 (blocked layout) 改善 L2 cache line 利用率
 4. S3/S4: AMX 2N tiling 复用 A tile
 5. S1: 融合 SwiGLU+quantize 到 VNNI kernel
+### R98b: silu rcp14+NR only (no GOMP_SPINCOUNT) [FAILED - not kept]
+**假设**: 仅替换 silu512_ps 中的 _mm512_div_ps 为 rcp14+Newton-Raphson，不修改 GOMP_SPINCOUNT。Pod-local 显示 +7% S1 改善。
+
+**结果** (grading A/B):
+- S1: R98b 0.00693s vs R96 0.00697s → 同 session 仅 -0.6% (噪声范围)
+- 但跨 session 对比 R88 历史数据: R98b 比 R88 慢 6.3%
+- **原因**: rcp14+NR 使用 4 条指令 (rcp14 + fnmadd + fmadd + mul) 替代 1 条 _mm512_div_ps。在 grading 节点上 throughput 下降超过 latency 改善。
+
+**决策**: 舍弃。集群恢复 R96。
+
+### R99: S2 第二个 OMP barrier 替换为 per-expert atomic spin-wait [NEUTRAL - not kept]
+**假设**: S2 路径有 2 个 OMP barrier。第二个 barrier (SwiGLU→down) 是全局同步，需要全部 15 线程到达。替换为 per-expert atomic flag spin-wait，使每个 expert 的 3 个 down 线程在该 expert 的 SwiGLU 完成后立即开始，无需等待其他 expert。
+
+**实现**:
+- 添加 `struct alignas(64) S2SwigluFlag { std::atomic<int> v; };` 避免 false sharing
+- SwiGLU 完成后 `store(1, release)`，down 前 `while(load(acquire)==0) _mm_pause()`
+- 移除第二个 `#pragma omp barrier`
+
+**初次实现 (无 padding)**: S2 pod-local 201μs (5x 退化!) — 5 个 atomic<int> 共享同一 cache line，15 线程 spin-wait 导致严重 false sharing。
+
+**修正 (加 padding)**: S2 pod-local 39.2μs (恢复正常)。正确性通过 (RMSE 7.36e-06)。
+
+**Grading 结果** (同 session A/B, 1 run each):
+
+| 版本 | S2 grading (s) | S2 speedup |
+|------|---------------|-----------|
+| R99  | 0.04432       | 13.89x    |
+| R96  | 0.04353       | 14.15x    |
+
+**差异**: R99 比 R96 慢 1.8% (噪声范围内)。无改善。
+
+**原因**: GOMP barrier 在 SPR 上已高度优化 (可能使用 MWAIT)，手动 spin-wait 无法超越。10 个 idle 线程的 spin-wait 消耗 CPU 资源 (L1/L2 带宽)，抵消了减少 barrier 开销的收益。
+
+**决策**: 舍弃。保留 R96。集群恢复 R96。
+
+### 5轮报告 (R96-R99)
+| 轮次 | 方向 | 结果 | 原因 |
+|------|------|------|------|
+| R97 | S1 down kernel 8→16 output tile | 失败 (crash) | 16 个 ZMM 累加器导致 heap corruption |
+| R98 | silu rcp14+NR + GOMP_SPINCOUNT | 失败 -6.3% | 更多指令降低 throughput |
+| R98b| silu rcp14+NR only | 失败 -6.3% | 同 R98，throughput 下降 |
+| R99 | S2 barrier→atomic spin-wait | 中性 +1.8% | GOMP barrier 已优化，spin-wait 无法超越 |
+| -   | (本 session 因集群维护提前结束) | - | - |
+
+### 最终状态: R96 仍为当前最佳 (commit b588610, GitHub 已同步)
+
+R96 grading 数据 (汇总多次运行):
+
+| 场景 | Grading median (s) | 加速比 | 分数(60pt基准) | 运行次数 |
+|------|-------------------|--------|----------------|---------|
+| S1 | 0.00697 | 7.26x | 40.3 | 7 runs |
+| S2 | 0.04077 | 15.11x | 38.7 | 5 runs |
+| S3 | 0.09264 | 71.4x | 100.6 | 1 run |
+| S4 | 1.45177 | 158.3x | 120.0 | 1 run |
+| **平均** | | | **~74.9** | |
+
+### 已尝试但失败的 S1/S2 优化汇总 (R71-R99)
+- S1 并行化: R71-R85, R90-R91, R97 (barrier/fork-join 开销或寄存器压力)
+- S1 K-loop unroll: R94 (寄存器压力)
+- S1 output tile 调整: R78(2→1), R81(2→4), R82(8→4), R97(8→16)
+- S2 chunking: R63(1), R64(2), R86(4) — 3 chunk 为最优
+- S2 output tile: R54(4→2), R65(4→6), R89(down 4→8)
+- S2 K-loop unroll: R77
+- S2 barrier 替换: R99 (atomic spin-wait)
+- silu 优化: R23(rcp14), R98/R98b(rcp14+NR)
+- S2 distributed SwiGLU: R79
+
+### 下一步计划 (未来 session)
+1. S1: 持久化线程池 (std::thread + atomic)，完全消除 fork/join 开销 — 最有潜力的未探索方向
+2. S2: 权重重排 (blocked layout) 改善 L2 cache line 利用率
+3. S3/S4: AMX 2N tiling 复用 A tile (S4 已封顶 120)
+4. S1: 融合 SwiGLU+quantize 到 VNNI kernel，减少内存流量
+5. S2: 尝试 2 H-chunks × 3 D-chunks 替代 3×3
+6. 考虑使用 profiler (perf/VTune) 深入分析 S1/S2 瓶颈
