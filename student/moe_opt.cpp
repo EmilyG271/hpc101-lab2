@@ -1266,15 +1266,17 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
 // 各专家把"反量化×路由权重"的输出写到独立 y_acc[k]，最后串行归约到 y。
 // 复用 R5 的 thread_local ExpertScratch 与 AMX 权限缓存。
 #if defined(_OPENMP)
-alignas(64) static float g_single_yacc[MAX_TOP_K][MAX_D_MODEL];
+alignas(64) static float g_single_yacc[MAX_TOP_K + 1][MAX_D_MODEL];
 static void compute_single_token_routed_experts_parallel(
-    const MoEWeights& w, float* y, int D, int H, int K, int nthreads) {
+    const float* x, const MoEWeights& w, float* y,
+    int D, int H, int K, int nthreads) {
     const int8_t* xq = g_quantized_x;
     const float x_scale = g_x_scale[0];
     const size_t expert_elems = (size_t)D * H;
     const int use_small_gate_up = should_use_small_m_kernel(1, D, H);
     const int use_small_down = should_use_small_m_kernel(1, H, D);
-    const int nt = (nthreads < K) ? nthreads : K;
+    const int num_tasks = K + 1;
+    const int nt = (nthreads < num_tasks) ? nthreads : num_tasks;
 
 #pragma omp parallel num_threads(nt)
     {
@@ -1283,26 +1285,42 @@ static void compute_single_token_routed_experts_parallel(
         tl_scratch.ensure(1, (size_t)D, (size_t)H);
 
 #pragma omp for schedule(static)
-        for (int k = 0; k < K; ++k) {
-            const int e = g_topk_indices[0][k];
-            const float route_weight = g_topk_weights[0][k];
-            const int8_t* w_gate_e = w.w_gate + (size_t)e * expert_elems;
-            const int8_t* w_up_e = w.w_up + (size_t)e * expert_elems;
-            const int8_t* w_down_e = w.w_down + (size_t)e * expert_elems;
-            float* y_acc = g_single_yacc[k];
+        for (int task = 0; task < num_tasks; ++task) {
+            const bool shared = task == 0;
+            const int e = shared ? -1 : g_topk_indices[0][task - 1];
+            const float route_weight = shared ? 1.0f : g_topk_weights[0][task - 1];
+            const int8_t* w_gate_e = shared ? w.sh_gate
+                : w.w_gate + (size_t)e * expert_elems;
+            const int8_t* w_up_e = shared ? w.sh_up
+                : w.w_up + (size_t)e * expert_elems;
+            const int8_t* w_down_e = shared ? w.sh_down
+                : w.w_down + (size_t)e * expert_elems;
+            const int8_t* packed_gate_e = shared ? g_packed_shared_gate
+                : g_packed_gate[e];
+            const int8_t* packed_up_e = shared ? g_packed_shared_up
+                : g_packed_up[e];
+            const int8_t* packed_down_e = shared ? g_packed_shared_down
+                : g_packed_down[e];
+            const int32_t* sum_gate_e = shared ? g_sum_shared_gate : g_sum_gate[e];
+            const int32_t* sum_up_e = shared ? g_sum_shared_up : g_sum_up[e];
+            const int32_t* sum_down_e = shared ? g_sum_shared_down : g_sum_down[e];
+            const float weight_scale_gate = shared ? g_scale_shared_gate : g_scale_gate[e];
+            const float weight_scale_up = shared ? g_scale_shared_up : g_scale_up[e];
+            const float weight_scale_down = shared ? g_scale_shared_down : g_scale_down[e];
+            float* y_acc = g_single_yacc[task];
 
             if (use_small_gate_up) {
                 small_m_gate_up_output_major(
                     xq, w_gate_e, w_up_e,
-                    g_sum_gate[e], g_sum_up[e],
+                    sum_gate_e, sum_up_e,
                     tl_scratch.gate_out, tl_scratch.up_out, 1, D, H);
             } else {
-                matmul_packed(xq, g_packed_gate[e], tl_scratch.gate_out, 1, D, H);
-                matmul_packed(xq, g_packed_up[e], tl_scratch.up_out, 1, D, H);
+                matmul_packed(xq, packed_gate_e, tl_scratch.gate_out, 1, D, H);
+                matmul_packed(xq, packed_up_e, tl_scratch.up_out, 1, D, H);
             }
 
-            const float scale_g = g_scale_gate[e] * x_scale;
-            const float scale_u = g_scale_up[e] * x_scale;
+            const float scale_g = weight_scale_gate * x_scale;
+            const float scale_u = weight_scale_up * x_scale;
             float max_abs = 0.0f;
 #if defined(__AVX512F__)
             {
@@ -1334,14 +1352,14 @@ static void compute_single_token_routed_experts_parallel(
 
             if (use_small_down) {
                 small_m_matmul_output_major(
-                    tl_scratch.quantized_gated, w_down_e, g_sum_down[e],
+                    tl_scratch.quantized_gated, w_down_e, sum_down_e,
                     tl_scratch.down_out, 1, H, D);
             } else {
-                matmul_packed(tl_scratch.quantized_gated, g_packed_down[e],
+                matmul_packed(tl_scratch.quantized_gated, packed_down_e,
                               tl_scratch.down_out, 1, H, D);
             }
 
-            const float dequant = hidden_scale * g_scale_down[e];
+            const float dequant = hidden_scale * weight_scale_down;
 #if defined(__AVX512F__)
             const __m512 dequant_vec = _mm512_set1_ps(dequant);
             const __m512 weight_vec = _mm512_set1_ps(route_weight);
@@ -1358,29 +1376,31 @@ static void compute_single_token_routed_experts_parallel(
 #endif
         }
     }
-    // 串行归约：y 已含 shared_expert(x) + 残差，叠加 K 个专家贡献。
 #if defined(__AVX512F__)
-    for (int k = 0; k < K; ++k) {
-        const float* yk = g_single_yacc[k];
-        for (int d = 0; d < D; d += 16) {
-            __m512 acc = _mm512_loadu_ps(y + d);
-            acc = _mm512_add_ps(acc, _mm512_loadu_ps(yk + d));
-            _mm512_storeu_ps(y + d, acc);
-        }
+    for (int d = 0; d < D; d += 16) {
+        __m512 acc = _mm512_loadu_ps(x + d);
+        for (int task = 0; task < num_tasks; ++task)
+            acc = _mm512_add_ps(acc, _mm512_loadu_ps(g_single_yacc[task] + d));
+        _mm512_storeu_ps(y + d, acc);
     }
 #else
-    for (int k = 0; k < K; ++k)
-        for (int d = 0; d < D; ++d)
-            y[d] += g_single_yacc[k][d];
+    for (int d = 0; d < D; ++d) {
+        float acc = x[d];
+        for (int task = 0; task < num_tasks; ++task)
+            acc += g_single_yacc[task][d];
+        y[d] = acc;
+    }
 #endif
 }
 #endif
 
 static void compute_single_token_routed_experts(
-    const MoEWeights& w, float* y, int D, int H, int K, int nthreads) {
+    const float* x, const MoEWeights& w, float* y,
+    int D, int H, int K, int nthreads) {
 #if defined(_OPENMP)
     if (nthreads > 1 && K >= 2) {
-        compute_single_token_routed_experts_parallel(w, y, D, H, K, nthreads);
+        compute_single_token_routed_experts_parallel(
+            x, w, y, D, H, K, nthreads);
         return;
     }
 #else
@@ -1859,20 +1879,24 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     }
 #endif
 
+#if defined(_OPENMP)
+    if (num_tokens == 1) {
+        int k_threads = K + 1;
+        const int np = omp_get_num_procs();
+        if (k_threads > np) k_threads = np;
+        if (k_threads < 1) k_threads = 1;
+        compute_single_token_routed_experts(
+            x, w, y, D, H, K, k_threads);
+        return;
+    }
+#endif
+
     compute_shared_expert(x, w, y, num_tokens, D, H);
 
     // N=1 不需要按专家聚拢：直接按 Top-K 顺序计算，跳过计数器、列表、
     // 16/512 专家全扫描以及输入 Gather。
     if (num_tokens == 1) {
-#if defined(_OPENMP)
-        int k_threads = K;
-        const int np = omp_get_num_procs();
-        if (k_threads > np) k_threads = np;
-        if (k_threads < 1) k_threads = 1;
-#else
-        const int k_threads = 1;
-#endif
-        compute_single_token_routed_experts(w, y, D, H, K, k_threads);
+        compute_single_token_routed_experts(x, w, y, D, H, K, 1);
         return;
     }
 
