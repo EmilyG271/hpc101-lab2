@@ -1,4 +1,4 @@
-﻿# Lab2 MoE W8A8 量化推理优化 - 测试数据记录
+# Lab2 MoE W8A8 量化推理优化 - 测试数据记录
 
 ## 评分标准 (hpc submit -c 16, 1000 迭代, --benchmark)
 
@@ -2052,3 +2052,74 @@ S1 从 50.5 下降到 48.1 (-2.4)，但被 S2 增益完全抵消。
 - **关键发现**: rcp14 帮助 S3 (+4.4 分，多次 silu 调用累积延迟节省) 但损害 S1 (-1.7 分，pipeline stall)。净效果: R107 (含 rcp14) 优于 R107b (不含 rcp14)。
 
 **决策**: 舍弃 R107b，保留 R107。R107 仍是最佳版本 (77.4 分)。
+
+### R108: exp 5th-order + S2 down 4->8 output tile [FAILED - reverted to R107]
+
+**假设**:
+1. SIMD: exp512_ps 从 7 阶 Taylor (7 FMA, err<1e-9) 降到 5 阶 (5 FMA, err~7e-4)。省 2 FMA/exp 调用，S3 有 ~1024 次 exp/thread，预计节省 ~2us (~2%)。
+2. 内存访问: S2 down kernel 从 4-output 改为 8-output tile，减半 _mm512_reduce_add_epi32 调用次数。D_BOUNDS {0,336,672,1024} 均可被 8 整除。
+
+**Grading 数据 (多次运行取最佳)**:
+
+| 场景 | R107 (s) | R108 best (s) | R107 分数 | R108 分数 | 变化 |
+|------|---------|-------------|---------|---------|------|
+| S1 | 0.00585 | 0.00574 | 48.1 | 49.0 | +0.9 |
+| S2 | 0.03956 | 0.03795 | 39.6 | 41.6 | +2.0 |
+| S3 | 0.09147 | 0.09473 | 101.8 | 98.4 | -3.4 |
+| S4 | 1.46497 | 1.46761 | 120.0 | 120.0 | 0 |
+| **平均** | | | **77.4** | **77.3** | **-0.1** |
+
+**分析**:
+- S3 回退 3.7% (91.5->94.7us)，exp 5 阶精度降低导致量化值略有变化，影响 AMX GEMM cache 行为。虽然 RMSE 几乎相同 (0.000781 vs 0.000776)，但实际 INT8 值不同，cache 模式改变。
+- S2 在 R108 中有时快 (0.038s) 有时慢 (0.043s)，不稳定。
+
+### R108b: 仅保留 S2 down 8-output (回退 exp 5th-order) [FAILED - reverted to R107]
+
+**假设**: 回退 exp 5th-order 消除 S3 回退，仅保留 S2 down 8-output tile 的 hsum 节省。
+
+**Grading 数据 (3 次运行)**:
+
+| 运行 | S2 (s) | 分数 |
+|------|---------|------|
+| Run 1 | 0.04428 | 35.6 |
+| Run 2 | 0.04508 | 35.0 |
+| Run 3 | 0.04403 | 35.8 |
+
+| 场景 | R107 (s) | R108b (s) | R107 分数 | R108b 分数 | 变化 |
+|------|---------|----------|---------|----------|------|
+| S1 | 0.00585 | 0.00570 | 48.1 | 49.4 | +1.3 |
+| S2 | 0.03956 | 0.04428 | 39.6 | 35.6 | -4.0 |
+| S3 | 0.09147 | 0.09215 | 101.8 | 101.1 | -0.7 |
+| S4 | 1.46497 | 1.45320 | 120.0 | 120.0 | 0 |
+| **平均** | | | **77.4** | **76.5** | **-0.9** |
+
+**分析**:
+- S2 一致退化 ~10% (39.6->44.3us)! 3 次运行均稳定在 0.044s 左右，非噪声。
+- **原因**: 8-output tile 导致 8 条并发 weight 访问流 (8 cache lines/k-iteration)，超过 L1 关联度上限，造成 cache thrashing。或 8 个累加器寄存器导致编译器 register spill。
+- **关键发现**: S2 down 4-output tile 是最优配置。8-output 虽然减少 hsum 次数，但 cache/register 开销远超收益。R89 的 "neutral" 结果可能是 pod-local 测试噪声。
+
+**决策**: 舍弃 R108 和 R108b，保留 R107 (77.4 分) 为最佳版本。
+
+### 当前最高分: R107 = 77.4 平均分
+
+### 本 session 完整优化总结
+本次 session 从 R104 (77.0) 出发:
+- R107: silu rcp14 (无 NR) + S2 set1 hoist — SUCCESS (+0.4 avg)
+- R107b: 仅 set1 hoist (回退 rcp14) — FAILED (S3 -4.4, rcp14 帮助 S3)
+- R108: exp 5th-order + S2 down 8-output — FAILED (S3 -3.4, exp 精度降低影响 cache)
+- R108b: 仅 S2 down 8-output — FAILED (S2 -4.0, 8-output cache thrashing)
+
+累计提升: +0.4 平均分 (77.0 -> 77.4)
+
+### 未来方向 (排除列表更新)
+- **S2 down 8-output tile 已排除** (R108/R108b, cache thrashing)
+- **exp 5th-order 已排除** (R108, 精度降低影响 cache 行为)
+- **silu rcp14+NR 已排除** (R98b, 额外 FMA 指令)
+- **silu rcp14 无 NR 已实现** (R107, S2 +3.7, S3 +0.4)
+
+### 下一步计划
+1. S2: 尝试 tree-based barrier 持久化线程池 (O(log N) 同步)
+2. S2: 权重重排 (blocked layout)
+3. S1: 融合 SwiGLU+quantize 到 VNNI kernel
+4. S3: AMX 2N tiling (S3 有 ~18 分提升空间到 120)
+5. 使用 perf/VTune 精确分析各阶段开销
