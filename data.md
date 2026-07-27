@@ -910,3 +910,73 @@ L1 cache miss stall (87% 周期)，由权重流式访问的 compulsory miss 构�
 2. S1 可尝试手动持久线程池完全消除 fork/join
 3. S2 可尝试 s2_gate_up_range 参数化 K (当前硬编码 1024/512)
 4. S3 可尝试融合 gather + AMX GEMM 减少数据搬运
+
+### R76 (S1 split gate/up VNNI, 2-output single-matrix) -- 无改善
+
+优化假设: S1 的 L1d (48KB) 无法容纳融合 gate_up 权重 (64KB)。将 gate/up
+分离为各自 32KB 的独立矩阵后，每个可完全驻留 L1，减少 compulsory miss。
+
+A/B 测试 (pod-local, R62 基线):
+| 版本 | S1 run1 | run2 | run3 | 中位 |
+|------|---------|------|------|------|
+| R62 基线 | 0.00698 | 0.00705 | 0.00703 | 0.00702 |
+| R76 (2-output split) | 0.00699 | 0.00705 | 0.00702 | 0.00702 |
+| R76 (4-output split) | 0.00725 | 0.00735 | -- | 0.00730 |
+
+结果: 2-output split 与 R62 完全一致。4-output 更差。已回退至 R62。
+
+失败原因: SPR L1d 实际 48KB, 64KB 融合工作集仅 1.3x thrash。分离后
+输入向量重载抵消了 L1 miss 减少的收益。
+
+### R77 (S2 K-loop unroll 128B/iter) -- 回退
+
+优化假设: 将 S2 gate_up K 循环步长从 64B 扩大到 128B (2 ZMM)，减少
+循环开销，提高 ILP。
+
+结果: S2 -16% 回退。寄存器压力导致代码质量下降。已回退至 R62。
+
+### R78 (S1 gate_up VNNI 2->1 output blocks) -- 回退
+
+优化假设: S1 gate_up VNNI 使用 2-output 块 (4 并发权重流: 2 gate + 2 up)。
+降至 1-output 块 (2 并发权重流: 1 gate + 1 up) 可减少 L1 miss 压力。
+
+A/B 测试 (pod-local, R62 基线):
+| 版本 | S1 run1 | run2 | run3 | 中位 |
+|------|---------|------|------|------|
+| R62 基线 | 0.00702 | -- | -- | 0.00702 |
+| R78 (1-output) | 0.00703 | 0.00759 | 0.00733 | 0.00733 |
+
+结果: R78 中位 0.00733s, 较 R62 0.00702s 回退 ~4.4%。RMSE 一致。
+
+失败原因: S1 瓶颈是 L2->L1 延迟 (~14c/miss), 非 MSHR 压力 (SPR 12 MSHR,
+4 并发 miss 未饱和)。减少并发流降低了 memory-level parallelism (MLP),
+减少了 L2 miss 与 VPDPBUSD 计算的重叠。已回退至 R62。
+
+关键教训: 减少 concurrent weight streams 会降低 MLP, 对 L2 延迟受限的
+S1 有害。S1 VNNI 路径已接近 L2->L1 带宽理论极限。
+
+### 本轮会话最终状态 (R76-R78)
+
+当前最佳版本: R62 (commit f858f42) -- 未变
+
+| 场景 | 时间(s) | 加速比 | 得分 |
+|------|---------|--------|------|
+| S1 | 0.00678 | 7.46x | 41.4 |
+| S2 | 0.03647 | 16.89x | 43.3 |
+| S3 | 0.09598 | 68.92x | 97.1 |
+| S4 | 1.46917 | 156.52x | 120.0 |
+平均得分: 75.5
+
+本轮会话尝试 R76-R78 共 3 轮优化，均失败回退。
+
+关键结论:
+1. S1 split gate/up (R76): L1 thrash 仅 1.3x, 分离后输入重载抵消收益
+2. S2 K-loop unroll (R77): 寄存器压力导致代码质量下降
+3. S1 1-output blocks (R78): 瓶颈是 L2 延迟而非 MSHR 压力, 减少 MLP 有害
+4. S1 VNNI 路径已接近理论极限: L2->L1 带宽是硬限制
+
+下一步计划:
+1. S1 可尝试 AMX tile 替代 VNNI (AMX tile load 可能比 VNNI load 更高效)
+2. S1 可尝试手动持久线程池完全消除 fork/join
+3. S2 的 3-chunk/15-thread 已是甜蜜点，难以进一步优化
+4. S3 仅需 ~3% 提升跨过 71x 阈值，可尝试融合 gather+AMX
