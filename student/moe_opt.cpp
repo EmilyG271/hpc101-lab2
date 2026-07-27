@@ -1335,7 +1335,8 @@ static void s2_down_range(const int8_t* hq, const int8_t* w_down,
 static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
                                           float* y, int D, int H, int K) {
     constexpr int NUM_EXPERTS = 5;
-    constexpr int NUM_THREADS = 10;
+    constexpr int NUM_CHUNKS = 3;
+    constexpr int NUM_THREADS = NUM_EXPERTS * NUM_CHUNKS;
     if (D != 1024 || H != 512 || K != 4 || omp_get_num_procs() < NUM_THREADS)
         return false;
 
@@ -1366,14 +1367,16 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
 
     const int8_t* xq = g_quantized_x;
     const float x_scale = g_x_scale[0];
+    static constexpr int H_BOUNDS[NUM_CHUNKS + 1] = {0, 168, 336, 512};
+    static constexpr int D_BOUNDS[NUM_CHUNKS + 1] = {0, 336, 672, 1024};
 #pragma omp parallel num_threads(NUM_THREADS)
     {
         const int tid = omp_get_thread_num();
-        const int slot = tid >> 1;
-        const int half = tid & 1;
+        const int slot = tid / NUM_CHUNKS;
+        const int chunk = tid % NUM_CHUNKS;
         s2_gate_up_range(xq, gate_w[slot], up_w[slot], gate_sum[slot],
                          up_sum[slot], g_s2_gate[slot], g_s2_up[slot], D,
-                         half * (H / 2), (half + 1) * (H / 2));
+                         H_BOUNDS[chunk], H_BOUNDS[chunk + 1]);
 #pragma omp barrier
         if (tid < NUM_EXPERTS) {
             float max_abs = 0.0f;
@@ -1396,8 +1399,8 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
         }
 #pragma omp barrier
         s2_down_range(g_s2_hidden_q[slot], down_w[slot], down_sum[slot],
-                      g_s2_down[slot], H, half * (D / 2),
-                      (half + 1) * (D / 2));
+                      g_s2_down[slot], H, D_BOUNDS[chunk],
+                      D_BOUNDS[chunk + 1]);
     }
 
     for (int d = 0; d < D; d += 16) {
