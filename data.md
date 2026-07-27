@@ -1785,3 +1785,54 @@ S3/S4 分数稳定 (S3: 0.09272 vs 0.09264, S4: 1.47129 vs 1.45177)。
 5. S2: 不同 chunking (2H×3D) — R64 失败但配置不同
 6. 使用 perf/VTune 精确分析 S1/S2 的 store/reduce/memory 开销占比
 7. **Barrier 消除已完全排除** (R99-R101b 全部失败)
+### R102: S1 持久化线程池 (std::thread + atomic) [SUCCESS - kept, commit 62e639e]
+
+**假设**: S1 每次调用 moe_forward_optimized 时，OMP 创建 5 线程团队 (fork) 并在结束后销毁 (join)，开销约 1-2us，占 S1 总运行时间 (~7us) 的 15-25%。使用持久化 std::thread 工作线程 + atomic epoch 计数器 spin-wait，完全消除 fork/join 开销。
+
+**实现**:
+- 提取 s1_exec_task() 函数：将 S1 每个专家的计算逻辑 (gate_up VNNI + SwiGLU + quantize + down VNNI + dequant) 提取为独立函数，接受 ExpertScratch& 参数
+- S1Worker 结构：包含 std::atomic epoch/done、ExpertScratch scratch、任务参数 (w, D, H, task, y_acc)
+- s1_worker_loop()：工作线程主循环，spin-wait (_mm_pause) 等待 epoch 变化，执行任务后 store done
+- ensure_s1_pool()：惰性创建工作线程 (首次调用时创建 K=4 个线程，detach)
+- compute_single_token_routed_experts_parallel()：当 nt == num_tasks (S1 场景) 时走持久化线程池路径，主线程做 task 0，4 个工作线程做 task 1-4，否则回退到 OMP 路径
+- 使用 release-acquire 内存序确保任务参数可见性
+
+**Pod-local A/B 对比** (S1, 1000 迭代, 3 次):
+
+| Run | R96 (us) | R102 (us) |
+|-----|----------|-----------|
+| 1 | 6.72 | 6.28 |
+| 2 | 7.47 | 6.49 |
+| 3 | 7.17 | 6.53 |
+| **Avg** | **7.12** | **6.43** |
+
+R102 比 R96 快 ~9.6% (pod-local)。S3 A/B 确认无退化。
+
+**Grading 数据**:
+
+| 场景 | Baseline (s) | R96 (s) | R102 (s) | R96 分数 | R102 分数 |
+|------|-------------|---------|----------|---------|----------|
+| S1 | 0.05061 | 0.00727 | 0.00653 | 38.7 | **43.0** |
+| S2 | 0.61609 | 0.04399 | 0.04500 | 35.9 | 35.1 |
+| S3 | 6.61416 | 0.09272 | 0.09240 | 100.4 | 100.8 |
+| S4 | 229.733 | 1.47129 | 1.46125 | 120.0 | 120.0 |
+| **平均** | | | | **73.8** | **74.7** |
+
+**分析**:
+- S1: 7.27us -> 6.53us (-10.1%)，分数 38.7 -> 43.0 (+4.3)，持久化线程池成功消除 fork/join 开销
+- S2: 44.0us -> 45.0us (+2.3%)，分数 35.9 -> 35.1 (-0.8)，在 grading 节点噪声范围内，S2 路径未修改
+- S3: 92.72us -> 92.40us (-0.3%)，分数 100.4 -> 100.8 (+0.4)，无变化
+- S4: 1.471s -> 1.461s (-0.7%)，分数 120.0 -> 120.0，已封顶
+- 净提升: +0.9 平均分 (73.8 -> 74.7)
+
+**决策**: 保留 R102。
+
+### 更新后的下一步计划
+1. S2: 权重重排 (blocked layout) — R35/R52 失败但可能实现方式不同
+2. S3/S4: AMX 2N tiling — S4 已封顶 120，S3 可小幅提升
+3. S1: 融合 SwiGLU+quantize 到 VNNI kernel — 减少内存流量
+4. S2: 不同 chunking (2H x 3D) — R64 失败但配置不同
+5. 使用 perf/VTune 精确分析 S1/S2 的 store/reduce/memory 开销占比
+6. **Barrier 消除已完全排除** (R99-R101b 全部失败)
+7. **S1 持久化线程池已实现** (R102, +4.3 分)
+8. 考虑 S1 工作线程 CPU 亲和性绑定 (sched_setaffinity) 以匹配 OMP_PROC_BIND=close
