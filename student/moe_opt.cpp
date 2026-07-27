@@ -1030,7 +1030,28 @@ static void amx_matmul_packed(const int8_t* A, const int8_t* B_pack,
         const int rows_m = std::min(TILE_M, M - m0);
         configure_amx_tiles(rows_m);
 
-        for (int n0 = 0; n0 < N; n0 += TILE_N) {
+        // R111: 2N tiling — process 2 N-tiles per iteration.
+        // A tile (tile 2) is loaded once and reused for both N-tiles,
+        // halving A-tile loads and issuing 2 dpbssd per k-iter for ILP.
+        for (int n0 = 0; n0 < N; n0 += 2 * TILE_N) {
+            if (n0 + 2 * TILE_N <= N) {
+                _tile_zero(0);
+                _tile_zero(1);
+                for (int k0 = 0; k0 < K; k0 += TILE_K) {
+                    _tile_loadd(2, A + (size_t)m0 * K + k0, K);
+                    _tile_loadd(3,
+                                B_pack + (size_t)(k0 / 4) * (N * 4) + n0 * 4,
+                                N * 4);
+                    _tile_loadd(4,
+                                B_pack + (size_t)(k0 / 4) * (N * 4) + (n0 + TILE_N) * 4,
+                                N * 4);
+                    _tile_dpbssd(0, 2, 3);
+                    _tile_dpbssd(1, 2, 4);
+                }
+                _tile_stored(0, C + (size_t)m0 * N + n0, N * 4);
+                _tile_stored(1, C + (size_t)m0 * N + n0 + TILE_N, N * 4);
+            } else {
+                // Remainder: single N-tile (odd N, not hit by S3/S4)
             _tile_zero(0);
             for (int k0 = 0; k0 < K; k0 += TILE_K) {
                 _tile_loadd(2, A + (size_t)m0 * K + k0, K);
@@ -1040,6 +1061,7 @@ static void amx_matmul_packed(const int8_t* A, const int8_t* B_pack,
                 _tile_dpbssd(0, 2, 3);
             }
             _tile_stored(0, C + (size_t)m0 * N + n0, N * 4);
+            }
         }
     }
 }
