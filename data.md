@@ -1836,6 +1836,99 @@ R102 比 R96 快 ~9.6% (pod-local)。S3 A/B 确认无退化。
 6. **Barrier 消除已完全排除** (R99-R101b 全部失败)
 7. **S1 持久化线程池已实现** (R102, +4.3 分)
 8. 考虑 S1 工作线程 CPU 亲和性绑定 (sched_setaffinity) 以匹配 OMP_PROC_BIND=close
+### R104: S1 工作线程 CPU 亲和性绑定 [SUCCESS - kept, commit a0adf05]
+
+**假设**: R102 的 std::thread 工作线程没有设置 CPU 亲和性，OS 调度器可能将工作线程放在不理想的 core 上。使用 sched_setaffinity 将每个工作线程绑定到特定 core (worker i -> core i+1)，可改善 L2/L3 局部性。
+
+**实现**:
+- 添加 pin_thread_to_core(core_id) 函数 (Linux sched_setaffinity)
+- 在 s1_worker_loop 开头调用 pin_thread_to_core(wid + 1)
+- Worker 0 -> core 1, Worker 1 -> core 2, Worker 2 -> core 3, Worker 3 -> core 4
+- 主线程不绑定 (保持在默认 core 上)
+
+**Pod-local 对比** (S1, 1000 迭代, 5 次):
+
+| Run | R103 (us) | R104 (us) |
+|-----|----------|-----------|
+| 1 | 6.23 | 4.73 |
+| 2 | 6.38 | 5.97 |
+| 3 | 6.95 | 6.40 |
+| 4 | 6.18 | 4.70 |
+| 5 | 6.27 | 4.58 |
+| **Avg** | **6.40** | **5.28** |
+
+R104 比 R103 快 ~17.5% (pod-local)。
+
+**Grading 数据**:
+
+| 场景 | Baseline (s) | R103 (s) | R104 (s) | R103 分数 | R104 分数 | 变化 |
+|------|-------------|----------|----------|-----------|-----------|------|
+| S1 | 0.05061 | 0.00634 | 0.00557 | 44.3 | **50.5** | +6.2 |
+| S2 | 0.61609 | 0.04370 | 0.04402 | 36.1 | 35.9 | -0.2 |
+| S3 | 6.61416 | 0.09322 | 0.09191 | 99.9 | 101.4 | +1.5 |
+| S4 | 229.733 | 1.49461 | 1.46755 | 120.0 | 120.0 | 0 |
+| **平均** | | | | **75.1** | **77.0** | **+1.9** |
+
+**分析**:
+- S1: 6.34us -> 5.57us (-12.1%)，分数 44.3 -> 50.5 (+6.2)，CPU 亲和性大幅改善 L2 局部性
+- S2/S3/S4: 在 grading 节点噪声范围内 (S2/S4 代码未修改)
+- 净提升: +1.9 平均分 (75.1 -> 77.0)，累计 +3.2 over R96 (73.8 -> 77.0)
+
+**决策**: 保留 R104。
+
+### R105: S1 主线程绑定到 core 0 [FAILED - reverted]
+
+**假设**: 将主线程也绑定到 core 0，使 5 个 S1 线程在相邻 core 0-4 上运行，进一步改善 L3 局部性。
+
+**结果** (pod-local, S1, 1000 迭代):
+- S1: ~10us (vs R104 ~5.3us, +90% 退化!!!)
+
+**原因**: pin_thread_to_core(0) 修改主线程的 CPU 亲和性，影响后续 OMP 并行区域 (quantize_input + compute_routing)。OMP runtime 无法正确放置线程，导致严重退化。
+
+**决策**: 舍弃。
+
+### R106: S2 持久化线程池 (3-phase, 无 barrier) [FAILED - reverted]
+
+**假设**: 将 S2 的 OMP fork/join + 2 barriers 替换为持久化线程池的 3-phase 方案 (gate_up -> SwiGLU -> down)，每阶段用 epoch 信号 + spin-wait 同步，消除 fork/join 开销 (~2us)。
+
+**结果** (pod-local, S2, 1000 迭代):
+- S2: 387us (vs R104 ~41us, +844% 退化!!!)
+
+**原因**: 3-phase 方案对 15 线程的同步开销远超 OMP barrier:
+- 每阶段: 1 epoch fetch_add + 15 worker done stores + 15 main thread done loads = 31 cache line transfers
+- 3 阶段: 93 transfers × ~100ns = 9.3us 同步开销
+- OMP fork/join + 2 barriers: ~2us (GOMP 使用 tree-based barrier, O(log N) cache traffic)
+- 3-phase 方案的 O(N) 同步开销是 OMP 的 4.5x
+
+**教训**: 持久化线程池的 spin-wait 同步只适用于少量线程 (S1: 4 workers, 24 transfers/phase)。对 15 线程的 S2，OMP 的 tree-based barrier 远更高效。
+
+**决策**: 舍弃。S2 持久化线程池方向已排除。
+
+### 当前最高分: R104 = 77.0 平均分
+
+### 本 session 优化总结
+本次 session 从 R96 (73.8) 出发，完成了 3 个成功优化:
+1. R102: S1 持久化线程池 — 消除 OMP fork/join 开销，S1 +4.3 分
+2. R103: 全局 epoch 计数器 — 减少 cache-line invalidation，S1 +1.3 分
+3. R104: S1 工作线程 CPU 亲和性 — 改善 L2 局部性，S1 +6.2 分
+累计提升: +3.2 平均分 (73.8 -> 77.0)
+
+S1 从 38.7 提升到 50.5 (+11.8)，是本次 session 的主要贡献。
+
+失败的尝试:
+- R105: 主线程绑定 core 0 — 与 OMP 冲突，+90% 退化
+- R106: S2 持久化线程池 3-phase — 15 线程同步开销过大，+844% 退化
+
+### 未来 session 下一步计划
+1. S2: 尝试 tree-based barrier 的持久化线程池 (O(log N) 同步开销)
+2. S2: 权重重排 (blocked layout) — R35/R52 失败但可能实现方式不同
+3. S3/S4: AMX 2N tiling — S4 已封顶 120，S3 可小幅提升
+4. S1: 融合 SwiGLU+quantize 到 VNNI kernel — 减少内存流量
+5. S1: 使用 sched_getaffinity 获取可用 core 列表，更鲁棒的线程绑定
+6. **Barrier 消除已完全排除** (R99-R101b 全部失败)
+7. **S1 持久化线程池已实现** (R102-R104, +11.8 分)
+8. **S2 持久化线程池 3-phase 已排除** (R106, 同步开销过大)
+9. 使用 perf/VTune 精确分析 S1/S2 的 store/reduce/memory 开销占比
 ### R103: S1 全局 epoch 计数器 (替代 per-worker epoch) [SUCCESS - kept, commit 9944fea]
 
 **假设**: R102 使用 per-worker epoch，每次信号需要 4 次 cache-line invalidation。使用单一全局 epoch 计数器，只需 1 次 invalidation，可减少 ~0.3us 同步开销。
