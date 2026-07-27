@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
+#include <thread>
 #include <immintrin.h>
 
 #if defined(_OPENMP)
@@ -1446,6 +1448,144 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
 }
 #endif
 
+// R102: Persistent thread pool for S1 — eliminates OMP fork/join overhead.
+// Each worker spin-waits on an epoch counter; main thread does task 0 in parallel.
+static inline void s1_exec_task(
+    const MoEWeights& w, int D, int H, int task,
+    bool use_small_gate_up, bool use_small_down,
+    ExpertScratch& scratch, float* y_acc) {
+    const int8_t* xq = g_quantized_x;
+    const float x_scale = g_x_scale[0];
+    const size_t expert_elems = (size_t)D * H;
+    const bool shared = task == 0;
+    const int e = shared ? -1 : g_topk_indices[0][task - 1];
+    const float route_weight = shared ? 1.0f : g_topk_weights[0][task - 1];
+    const int8_t* w_gate_e = shared ? w.sh_gate
+        : w.w_gate + (size_t)e * expert_elems;
+    const int8_t* w_up_e = shared ? w.sh_up
+        : w.w_up + (size_t)e * expert_elems;
+    const int8_t* w_down_e = shared ? w.sh_down
+        : w.w_down + (size_t)e * expert_elems;
+    const int8_t* packed_gate_e = shared ? g_packed_shared_gate
+        : g_packed_gate[e];
+    const int8_t* packed_up_e = shared ? g_packed_shared_up
+        : g_packed_up[e];
+    const int8_t* packed_down_e = shared ? g_packed_shared_down
+        : g_packed_down[e];
+    const int32_t* sum_gate_e = shared ? g_sum_shared_gate : g_sum_gate[e];
+    const int32_t* sum_up_e = shared ? g_sum_shared_up : g_sum_up[e];
+    const int32_t* sum_down_e = shared ? g_sum_shared_down : g_sum_down[e];
+    const float weight_scale_gate = shared ? g_scale_shared_gate : g_scale_gate[e];
+    const float weight_scale_up = shared ? g_scale_shared_up : g_scale_up[e];
+    const float weight_scale_down = shared ? g_scale_shared_down : g_scale_down[e];
+
+    if (use_small_gate_up) {
+        small_m_gate_up_output_major(
+            xq, w_gate_e, w_up_e,
+            sum_gate_e, sum_up_e,
+            scratch.gate_out, scratch.up_out, 1, D, H);
+    } else {
+        matmul_packed(xq, packed_gate_e, scratch.gate_out, 1, D, H);
+        matmul_packed(xq, packed_up_e, scratch.up_out, 1, D, H);
+    }
+
+    const float scale_g = weight_scale_gate * x_scale;
+    const float scale_u = weight_scale_up * x_scale;
+    float max_abs = 0.0f;
+#if defined(__AVX512F__)
+    {
+        const __m512 sg = _mm512_set1_ps(scale_g);
+        const __m512 su = _mm512_set1_ps(scale_u);
+        const int32_t* go = scratch.gate_out;
+        const int32_t* uo = scratch.up_out;
+        __m512 vmax = _mm512_setzero_ps();
+        for (int h = 0; h < H; h += 16) {
+            __m512 gate = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(go + h)), sg);
+            __m512 up   = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_loadu_si512(uo + h)), su);
+            __m512 value = _mm512_mul_ps(silu512_ps(gate), up);
+            _mm512_storeu_ps(scratch.gated_fp32 + h, value);
+            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(_mm512_set1_ps(-0.0f), value));
+        }
+        max_abs = _mm512_reduce_max_ps(vmax);
+    }
+#else
+    for (int h = 0; h < H; ++h) {
+        const float gate = (float)scratch.gate_out[h] * scale_g;
+        const float up = (float)scratch.up_out[h] * scale_u;
+        const float value = (gate / (1.0f + expf(-gate))) * up;
+        scratch.gated_fp32[h] = value;
+        max_abs = std::max(max_abs, fabsf(value));
+    }
+#endif
+    const float hidden_scale = quantize_hidden_row(
+        scratch.gated_fp32, scratch.quantized_gated, H, max_abs);
+
+    if (use_small_down) {
+        small_m_matmul_output_major(
+            scratch.quantized_gated, w_down_e, sum_down_e,
+            scratch.down_out, 1, H, D);
+    } else {
+        matmul_packed(scratch.quantized_gated, packed_down_e,
+                      scratch.down_out, 1, H, D);
+    }
+
+    const float dequant = hidden_scale * weight_scale_down;
+#if defined(__AVX512F__)
+    const __m512 dequant_vec = _mm512_set1_ps(dequant);
+    const __m512 weight_vec = _mm512_set1_ps(route_weight);
+    for (int d = 0; d < D; d += 16) {
+        const __m512i out_i32 = _mm512_loadu_si512(scratch.down_out + d);
+        const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+        const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
+        const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
+        _mm512_storeu_ps(y_acc + d, contribution);
+    }
+#else
+    for (int d = 0; d < D; ++d)
+        y_acc[d] = route_weight * ((float)scratch.down_out[d] * dequant);
+#endif
+}
+
+struct S1Worker {
+    std::atomic<uint32_t> epoch{0};
+    std::atomic<uint32_t> done{0};
+    ExpertScratch scratch;
+    const MoEWeights* w;
+    int D, H, task;
+    bool use_small_gate_up, use_small_down;
+    float* y_acc;
+};
+
+static S1Worker g_s1_wkrs[MAX_TOP_K];
+static std::thread g_s1_thrds[MAX_TOP_K];
+static int g_s1_pool_sz = 0;
+
+static void s1_worker_loop(int wid) {
+    S1Worker& wk = g_s1_wkrs[wid];
+    if (g_amx_runtime_enabled && !wk.scratch.amx_perm)
+        wk.scratch.amx_perm = request_amx_permission();
+    uint32_t seen = 0;
+    for (;;) {
+        while (wk.epoch.load(std::memory_order_acquire) == seen)
+            _mm_pause();
+        seen = wk.epoch.load(std::memory_order_acquire);
+        if (seen == 0xFFFFFFFFu) break;
+        wk.scratch.ensure(1, (size_t)wk.D, (size_t)wk.H);
+        s1_exec_task(*wk.w, wk.D, wk.H, wk.task,
+                     wk.use_small_gate_up, wk.use_small_down,
+                     wk.scratch, wk.y_acc);
+        wk.done.store(seen, std::memory_order_release);
+    }
+}
+
+static void ensure_s1_pool(int nworkers) {
+    for (int i = g_s1_pool_sz; i < nworkers; i++) {
+        g_s1_thrds[i] = std::thread(s1_worker_loop, i);
+        g_s1_thrds[i].detach();
+    }
+    g_s1_pool_sz = nworkers;
+}
+
 static void compute_single_token_routed_experts_parallel(
     const float* x, const MoEWeights& w, float* y,
     int D, int H, int K, int nthreads) {
@@ -1456,6 +1596,53 @@ static void compute_single_token_routed_experts_parallel(
     const int use_small_down = should_use_small_m_kernel(1, H, D);
     const int num_tasks = K + 1;
     const int nt = (nthreads < num_tasks) ? nthreads : num_tasks;
+
+    // R102: Persistent thread pool path (one worker per routed expert).
+    // Eliminates OMP fork/join overhead (~1-2us per call out of ~7us total).
+    if (nt == num_tasks && num_tasks >= 2) {
+        const int nworkers = num_tasks - 1;
+        ensure_s1_pool(nworkers);
+
+        for (int i = 0; i < nworkers; i++) {
+            g_s1_wkrs[i].w = &w;
+            g_s1_wkrs[i].D = D;
+            g_s1_wkrs[i].H = H;
+            g_s1_wkrs[i].task = i + 1;
+            g_s1_wkrs[i].use_small_gate_up = use_small_gate_up;
+            g_s1_wkrs[i].use_small_down = use_small_down;
+            g_s1_wkrs[i].y_acc = g_single_yacc[i + 1];
+            g_s1_wkrs[i].epoch.fetch_add(1, std::memory_order_release);
+        }
+
+        if (g_amx_runtime_enabled && !tl_scratch.amx_perm)
+            tl_scratch.amx_perm = request_amx_permission();
+        tl_scratch.ensure(1, (size_t)D, (size_t)H);
+        s1_exec_task(w, D, H, 0, use_small_gate_up, use_small_down,
+                     tl_scratch, g_single_yacc[0]);
+
+        for (int i = 0; i < nworkers; i++) {
+            const uint32_t e = g_s1_wkrs[i].epoch.load(std::memory_order_relaxed);
+            while (g_s1_wkrs[i].done.load(std::memory_order_acquire) != e)
+                _mm_pause();
+        }
+
+#if defined(__AVX512F__)
+        for (int d = 0; d < D; d += 16) {
+            __m512 acc = _mm512_loadu_ps(x + d);
+            for (int task = 0; task < num_tasks; ++task)
+                acc = _mm512_add_ps(acc, _mm512_loadu_ps(g_single_yacc[task] + d));
+            _mm512_storeu_ps(y + d, acc);
+        }
+#else
+        for (int d = 0; d < D; ++d) {
+            float acc = x[d];
+            for (int task = 0; task < num_tasks; ++task)
+                acc += g_single_yacc[task][d];
+            y[d] = acc;
+        }
+#endif
+        return;
+    }
 
 #pragma omp parallel num_threads(nt)
     {
