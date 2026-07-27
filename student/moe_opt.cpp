@@ -1312,20 +1312,20 @@ static inline void s2_gate_up_range(
 static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
                                  const int32_t* row_sums, int32_t* down_out,
                                  int begin, int end) {
-    const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
-    for (int n0 = begin; n0 < end; n0 += 8) {
-        __m512i acc[8];
-        for (int j = 0; j < 8; ++j) acc[j] = _mm512_setzero_si512();
+   const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+    for (int n0 = begin; n0 < end; n0 += 4) {
+        __m512i acc[4];
+        for (int j = 0; j < 4; ++j) acc[j] = _mm512_setzero_si512();
         for (int k0 = 0; k0 < 512; k0 += 64) {
             const __m512i a_u8 = _mm512_xor_si512(
                 _mm512_loadu_si512(hq + k0), sign_flip);
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < 4; ++j) {
                 const __m512i wv = _mm512_loadu_si512(
                     w_down + (size_t)(n0 + j) * 512 + k0);
                 acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
             }
         }
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < 4; ++j) {
             down_out[n0 + j] = _mm512_reduce_add_epi32(acc[j]) -
                                 128 * row_sums[n0 + j];
         }
@@ -1992,8 +1992,11 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             opt_threads = (num_procs < 8) ? num_procs : 8;
         } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
             opt_threads = (num_procs < 8) ? num_procs : 8;
-        } else {
-            opt_threads = 1;
+       } else {
+            // N < 64: keep the OMP thread pool warm so that the
+            // single-token parallel expert path (S1: 5 threads,
+            // S2: 15 threads) doesn't pay full fork/join cost every call.
+            opt_threads = (num_procs < 16) ? num_procs : 16;
         }
         omp_set_num_threads(opt_threads);
     }
