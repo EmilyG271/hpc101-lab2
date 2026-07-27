@@ -1500,3 +1500,62 @@ S2 grading ???? (0.0401054 vs 0.0401091)?8-output tile ??????
 3. ??????? R83 (AMX 2N tiling)
 4. S1: ?? SwiGLU+quantize ??? VNNI kernel (??????)
 5. S2: ?? L2 ???????? (VTune profiler)
+
+---
+
+## R90-R92: S1/S2 微优化尝试 + 集群维护终止 (2026-07-28)
+
+### R90: S1 VNNI load reordering + K-loop unroll [FAILED - neutral, reverted]
+**假设**: 在 VNNI gate_up 和 down kernel 中，将 load 指令提前到 VPDPBUSD 之前，并添加 `#pragma GCC unroll 4` (K loop) / `#pragma GCC unroll 8` (j loop)，减少指令延迟并改善指令级并行。
+
+**结果**: S1 median 0.00706s vs R88 0.00675s (-4.6%)
+
+**原因**: GCC -O3 已自动重排指令和展开循环，手动干预反而干扰编译器寄存器分配。
+
+### R91: S1 OMP pool size 16->K+1=5 [FAILED - worse, reverted]
+**假设**: 将 OMP 线程池从 16 缩小到 K+1=5，减少 fork/join 开销和 idle 线程的 cache 污染。
+
+**结果**: S1 median 0.00740s vs R88 0.00675s (-9.6%)
+
+**原因**: 更大的线程池 (16) 让线程保持热状态，减少 fork/join 延迟。缩小池反而增加唤醒延迟。
+
+### R92: AMX 2N tiling for amx_matmul_packed [NOT APPLIED]
+**目标**: 为 down kernel 的 AMX 路径实现 2N tiling (tile 0/1 作为累加器，tile 2 作为 A，tile 3/4 作为 B)，复用 A tile 跨 2 个 N-tile。
+
+**状态**: 代码修改未成功应用 (Python 字符串匹配失败)。集群即将进入维护状态，未继续尝试。
+
+**影响**: 仅影响 S3/S4 (AMX 路径)，不影响 S1/S2 (VNNI 路径)。S4 已达 120 分上限。
+
+### 当前最佳: R88 (commit 6436095, pushed to GitHub origin/main at 15884e3)
+| 场景 | Grading (s) | 加速比 | 估计分数 |
+|------|------------|--------|---------|
+| S1 | 0.00675 | 7.49x | 41.6 |
+| S2 | 0.04011 | 15.36x | 39.4 |
+| S3 | 0.09168 | 72.14x | 101.6 |
+| S4 | 1.46718 | 156.6x | 120.0 |
+| **平均** | | | **75.7** |
+
+注: S1/S2 受集群噪声影响 (±15%)，实际分数范围 ~75.1-75.7
+
+### 瓶颈分析
+- **S1 (7.49x, 41.6pt)**: 瓶颈是 L3 权重带宽。5 线程并行加载 5 个专家的权重 (~480KB 总计)，受限于 L3 带宽 (~60GB/s)。fork/join 开销 (~1-2us) 相对于总运行时间 (~6.75us) 占比较小。所有 S1 并行化尝试 (R71-R85, R90-R91) 均因 barrier/fork-join 开销或带宽限制而失败。
+- **S2 (15.36x, 39.4pt)**: 瓶颈是 L2/L3 权重带宽。15 线程并行加载 5 个专家的权重 (~7.5MB 总计)，3-chunk/15-thread 是 L2 带宽的甜点。所有 S2 线程数/输出 tile 调整 (R63-R86, R89) 均未改善。
+
+### 5轮报告 (R85-R92)
+| 轮次 | 方向 | 结果 | 失败原因 |
+|------|------|------|---------|
+| R85 | S1 N-split 8 threads | 失败 (-7.6%) | barrier 开销 (~7us) 占主导 |
+| R86 | S2 4 chunks/20 threads | 失败 (-52%) | L2 争用加剧 |
+| R87 | S3 lazy memset | 成功 (+1.3 avg) | 消除 L2 cache 污染 |
+| R88 | S4 conditional memset | 成功 (+0.1 avg) | 恢复 S4 不受 R87 影响 |
+| R89 | S2 down 8-output tile | 失败 (0%) | 瓶颈是 L2 带宽不是输入复用 |
+| R90 | S1 VNNI load reorder + unroll | 失败 (-4.6%) | 编译器已自动优化 |
+| R91 | S1 OMP pool 16->5 | 失败 (-9.6%) | 大池保持线程热状态 |
+| R92 | AMX 2N tiling | 未应用 | 代码匹配失败 + 集群维护 |
+
+### 下一步计划 (集群恢复后)
+1. S1: 持久化线程池 (std::thread + atomic spin-wait)，完全消除 fork/join 开销 (~7% 潜在收益)
+2. S2: VTune profiler 分析 L2 带宽瓶颈，确认是否有进一步优化空间
+3. R92: 修复 AMX 2N tiling 代码匹配问题，重新测试 (仅影响 S3/S4)
+4. S1: 融合 SwiGLU+quantize 到 VNNI kernel，减少内存读写
+5. S2: 尝试权重重排 (blocked layout) 改善 L2 cache line 利用率
