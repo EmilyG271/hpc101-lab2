@@ -1713,8 +1713,12 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
         tl_scratch.ensure((size_t)max_count, (size_t)D, (size_t)H);
 
         float* y_acc = yacc_pool + (size_t)tid * ystride;
-        // R87: Lazy y_acc init — skip full memset to preserve L2 cache state.
-        // Track first-write per token; zero untouched tokens after the expert loop.
+        // R87/R88: Lazy y_acc init only for small ystride (S3, <=L2).
+        // For large ystride (S4, >L2): full memset is faster - lazy init's branch
+        // overhead and zero-untouched pass add cost without L2 benefit.
+        const bool use_lazy_init = (ystride < 131072);
+        if (!use_lazy_init)
+            std::memset(y_acc, 0, ystride * sizeof(float));
         char token_init[MAX_NUM_TOKENS] = {0};
 
 #pragma omp for schedule(dynamic)
@@ -1790,7 +1794,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
 #if defined(__AVX512F__)
                 const __m512 dequant_vec = _mm512_set1_ps(dequant);
                 const __m512 weight_vec = _mm512_set1_ps(route_weight);
-                if (token_init[t]) {
+                if (!use_lazy_init || token_init[t]) {
                     for (int d = 0; d < D; d += 16) {
                         const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
                         const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
@@ -1810,7 +1814,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
                     token_init[t] = 1;
                 }
 #else
-                if (token_init[t]) {
+                if (!use_lazy_init || token_init[t]) {
                     for (int d = 0; d < D; ++d)
                         y_t[d] += route_weight * ((float)out_t[d] * dequant);
                 } else {
@@ -1822,10 +1826,12 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
             }
         }
 
-        // R87: Zero untouched tokens for correct reduction, then barrier
-        for (int t = 0; t < num_tokens; ++t) {
-            if (!token_init[t])
-                std::memset(y_acc + (size_t)t * D, 0, D * sizeof(float));
+        // R87/R88: Zero untouched tokens (lazy path only), then barrier
+        if (use_lazy_init) {
+            for (int t = 0; t < num_tokens; ++t) {
+                if (!token_init[t])
+                    std::memset(y_acc + (size_t)t * D, 0, D * sizeof(float));
+            }
         }
 #pragma omp barrier
 
