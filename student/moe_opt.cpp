@@ -477,7 +477,10 @@ static inline __m512 exp512_ps(__m512 x) {
 static inline __m512 silu512_ps(__m512 v) {
     __m512 neg = _mm512_xor_ps(v, _mm512_set1_ps(-0.0f));
     __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp512_ps(neg));
-    return _mm512_div_ps(v, denom);
+    // R107: rcp14 replaces div — 14-bit reciprocal (rel err < 6e-5) is far
+    // below INT8 quantization tolerance (1/128 ~ 0.008). Latency 4+4=8c vs div 13-15c.
+    // Unlike R98b (rcp14+NR, 3 instr), this uses fewer instructions than the original.
+    return _mm512_mul_ps(v, _mm512_rcp14_ps(denom));
 }
 #endif
 
@@ -1446,14 +1449,17 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
                       D_BOUNDS[chunk + 1]);
     }
 
+    // R107: Hoist dequant set1 out of d loop — scale is loop-invariant
+    __m512 dequant_v[5];
+    for (int slot = 0; slot < NUM_EXPERTS; ++slot)
+        dequant_v[slot] = _mm512_set1_ps(
+            g_s2_hidden_scale[slot] * down_scale[slot] * route_scale[slot]);
     for (int d = 0; d < D; d += 16) {
         __m512 acc = _mm512_loadu_ps(x + d);
         for (int slot = 0; slot < NUM_EXPERTS; ++slot) {
-            const __m512 dequant = _mm512_set1_ps(
-                g_s2_hidden_scale[slot] * down_scale[slot] * route_scale[slot]);
             acc = _mm512_fmadd_ps(
                 _mm512_cvtepi32_ps(_mm512_loadu_si512(g_s2_down[slot] + d)),
-                dequant, acc);
+                dequant_v[slot], acc);
         }
         _mm512_storeu_ps(y + d, acc);
     }
