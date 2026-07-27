@@ -1718,3 +1718,70 @@ R96 grading 数据 (汇总多次运行):
 4. S1: 融合 SwiGLU+quantize 到 VNNI kernel，减少内存流量
 5. S2: 尝试 2 H-chunks × 3 D-chunks 替代 3×3
 6. 考虑使用 profiler (perf/VTune) 深入分析 S1/S2 瓶颈
+### R100: S2 5-thread no-barrier (NUM_CHUNKS=1) [FAILED - not kept]
+**假设**: 用 5 线程 (1 per expert) 替代 15 线程 (3 per expert)，每个 expert 的 1.5MB 权重可留在 L2 (2MB)，L2 带宽 (~200 GB/s per core) 远高于共享 L3 带宽。1 chunk per expert = 无跨线程依赖 = 两个 barrier 全部移除。
+
+**结果** (pod-local, correct):
+- S2: 56.6μs (vs R96 ~39.2μs, +44% 退化!)
+- S1: 7.5μs (不变，代码未修改)
+
+**原因**: 5 线程的聚合带宽 (5×200=1000 GB/s 理论) 不足以弥补 15 线程的并行度。实际权重数据不在 L2 (被 gate_up 和 down 之间的 SwiGLU 干扰)，仍需从 L3 加载。15 线程方案虽用 L3，但聚合 L3 带宽更高。
+
+**决策**: 舍弃。
+
+### R101: S2 eliminate barrier 2 with local stack buffers [FAILED - massive regression]
+**假设**: 保留 15 线程 3-chunk 结构，但移除第二个 barrier。所有 15 线程冗余计算 SwiGLU + quantize 到本地栈数组 (alignas(64) float local_hidden[MAX_D_FF])，然后各自做 down chunk。冗余 SwiGLU 开销仅 ~0.22μs (可忽略)。
+
+**结果** (pod-local, correct):
+- S2: 107.3μs (vs R96 ~39.2μs, +174% 退化!!!)
+
+**原因**: `alignas(64) float local_hidden[MAX_D_FF]` (8KB) + `int8_t local_hidden_q[MAX_D_FF]` (2KB) 的栈数组导致巨大的开销。每线程 10KB 栈空间可能触发编译器生成不同的代码 (寄存器溢出、栈帧重排)。R101b 测试确认栈数组本身贡献了 43μs 退化。
+
+**决策**: 舍弃。
+
+### R101b: S2 eliminate barrier 2 with global buffers [FAILED - cache bouncing]
+**假设**: 与 R101 相同，但使用全局 g_s2_hidden[slot] 和 g_s2_hidden_q[slot] 而非栈数组。3 个同 expert 线程写入相同数组 (相同数据，良性竞争)。
+
+**结果** (pod-local, correct):
+- S2: 64.1μs (vs R96 ~39.2μs, +63% 退化)
+
+**原因**: 3 个线程写入相同的 64 cache lines (g_s2_hidden: 32 lines + g_s2_hidden_q: 16 lines) 导致严重 cache bouncing。每次写入导致其他 core 的 cache line 失效。64 lines × 6 invalidations × ~100ns ≈ 38μs 额外开销。
+
+**R101 vs R101b 对比**:
+- R101 (栈数组): 107.3μs → 栈数组贡献 43.2μs + cache bouncing 24.9μs
+- R101b (全局数组): 64.1μs → 仅 cache bouncing 24.9μs
+- 结论: 栈数组和 cache bouncing 都是问题
+
+**决策**: 舍弃。GOMP barrier 远比任何替代同步方案更高效。
+
+### Barrier 消除实验总结
+| 轮次 | 方法 | S2 pod-local | vs R96 | 失败原因 |
+|------|------|-----------|--------|---------|
+| R99 | atomic spin-wait | ~40μs | +1.8% | GOMP barrier 已优化 |
+| R100 | 5线程无barrier | 56.6μs | +44% | 聚合带宽不足 |
+| R101 | 栈数组无barrier2 | 107.3μs | +174% | 栈数组开销 + cache bouncing |
+| R101b | 全局数组无barrier2 | 64.1μs | +63% | cache bouncing |
+
+**结论**: S2 的 GOMP barrier 极度优化 (可能使用 MWAIT)，任何手动同步方案都无法超越。Barrier 消除方向已完全排除。
+
+### R96 本 session grading 数据 (fresh)
+
+| 场景 | Baseline (s) | Grading (s) | 加速比 | 分数(60pt) |
+|------|-------------|------------|--------|-----------|
+| S1 | 0.05061 | 0.00727 | 6.96x | 38.7 |
+| S2 | 0.61609 | 0.04399 | 14.0x | 35.9 |
+| S3 | 6.61416 | 0.09272 | 71.3x | 100.4 |
+| S4 | 229.733 | 1.47129 | 156.1x | 120.0 |
+| **平均** | | | | **73.8** |
+
+注: 本 session grading 节点比前一 session 慢 ~1-2% (S1: 7.27 vs 6.97, S2: 43.99 vs 40.77)。
+S3/S4 分数稳定 (S3: 0.09272 vs 0.09264, S4: 1.47129 vs 1.45177)。
+
+### 更新后的下一步计划
+1. S1: 持久化线程池 (std::thread + atomic) — 唯一有潜力的未探索方向，但实现复杂
+2. S2: 权重重排 (blocked layout) — R35/R52 失败但可能实现方式不同
+3. S3/S4: AMX 2N tiling — S4 已封顶 120，S3 可小幅提升
+4. S1: 融合 SwiGLU+quantize 到 VNNI kernel — 减少内存流量，但中间数据很小
+5. S2: 不同 chunking (2H×3D) — R64 失败但配置不同
+6. 使用 perf/VTune 精确分析 S1/S2 的 store/reduce/memory 开销占比
+7. **Barrier 消除已完全排除** (R99-R101b 全部失败)
