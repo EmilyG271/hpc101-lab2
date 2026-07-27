@@ -29,6 +29,19 @@ static void tune_omp_affinity() {
     setenv("OMP_PLACES", "cores", 0);
 }
 #endif
+// R104: Pin S1 persistent worker threads to specific cores for cache locality
+#if defined(__linux__)
+#include <sched.h>
+static void pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+}
+#else
+static void pin_thread_to_core(int) {}
+#endif
+
 
 
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__) && defined(__linux__)
@@ -1562,6 +1575,8 @@ static std::atomic<uint32_t> g_s1_epoch{0};
 
 static void s1_worker_loop(int wid) {
     S1Worker& wk = g_s1_wkrs[wid];
+    // R104: Pin each worker to a distinct core adjacent to the main thread
+    pin_thread_to_core(wid + 1);
     if (g_amx_runtime_enabled && !wk.scratch.amx_perm)
         wk.scratch.amx_perm = request_amx_permission();
     uint32_t seen = 0;
