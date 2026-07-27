@@ -546,3 +546,10 @@ OpenMP barrier。
 
 **失败原因:** 虽然权重访问变为连续，4-byte 输入广播和 K4 粒度循环显著增加前端与加载操作；
 消除水平归约不足以抵消这些成本。已删除专用 pack 和 kernel，恢复 R49。
+
+### R49 S2 Topdown 复测
+
+`hpc submit -p lab2 -c 16 perf stat --topdown -- ./build/lab2 1 1024 512 16 4 10000 --benchmark`
+得到 `backend_bound=70.5%`、`retiring=19.4%`、`frontend_bound=8.4%`、
+`bad_speculation=1.7%`。15 线程 VNNI 投影的剩余瓶颈已主要是后端数据供给/内存层次，
+并非 Router、分支或前端；后续应避免增加复制、预取和额外同步的微调。
