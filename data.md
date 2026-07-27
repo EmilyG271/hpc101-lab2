@@ -1636,6 +1636,7 @@ R96 实际 S1 改善 vs R88 (同 session): +4.3%。
 | R94 | S1 K-loop unroll by 2 | 失败 -3.5% | 寄存器压力干扰编译器调度 |
 | R95 | zmm_hsum_i32 所有 kernel | 混合 | S1 +4% S2 -6.6%，S2 退化 |
 | R96 | zmm_hsum_i32 仅 S1 | 成功 +3.2% | S1 改善，S2/S3/S4 不变 |
+| R97 | S1 down kernel 8->16 output tile | 失败 (crash) | 16 个 ZMM 累加器导致 heap corruption (buffer overflow 或栈溢出) |
 
 ### 下一步计划
 1. S1: grading 测试确认 R96 实际分数 (集群恢复后)
