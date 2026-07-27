@@ -1331,3 +1331,75 @@ S1/S2 优化空间已接近极限:
 2. S3 AMX: 尝试 3N tiling (7 tiles)
 3. S1: 持久线程池 (std::thread + atomic spin-wait), 消除 fork/join
 4. 低负载环境重测 R83 (2N tiling)
+
+---
+
+## R86: S2 NUM_CHUNKS 3->4 (20 threads) (2026-07-28)
+
+### 优化假设
+4 chunks 替代 3, 每线程权重从 500KB 降到 375KB, 更好的 L2 命中率。H/D bounds 变为 2 的幂 (128/256), 改善对齐。额外 5 线程提供 33% 更多聚合 L2 带宽。
+
+### A/B 测试 (pod-local, 10 runs each)
+| 版本 | S2 中位数(s) |
+|------|-------------|
+| R62 (3 chunks, 15 threads) | 0.040 |
+| R86 (4 chunks, 20 threads) | 0.061 |
+
+### 结果: 回退 (-52%)
+R86 S2 慢 52%。20 线程导致 L2 竞争加剧, 15 idle 线程在 SwiGLU 期间 spin-wait 开销增加。
+
+### 失败原因
+1. 20 线程竞争 10 个 L2 slice, 带宽竞争加剧
+2. 15 idle 线程在 SwiGLU 阶段 spin-wait 污染更多 cache
+3. 3 chunks/15 threads 已确认为 S2 甜蜜点 (R63-R65, R86 全部确认)
+4. 额外 barrier 开销 (~0.4us) 虽小, 但 L2 竞争才是主因
+
+---
+
+## R87: S3 lazy memset elimination (2026-07-28) **[SUCCESS - NEW BEST]**
+
+### 优化假设
+`std::memset(y_acc, 0, 128KB)` 在 expert 计算前刷新 L1/L2 cache, 影响 weight 加载性能。用 lazy init (首次写入直接 store, 后续 accumulate) 替代, 保留 cache 状态。
+
+### 设计
+- 移除 `std::memset(y_acc, 0, ystride * sizeof(float))`
+- 添加 `char token_init[MAX_NUM_TOKENS] = {0}` 跟踪每线程首次写入
+- AVX-512 路径: if(token_init[t]) accumulate else direct store + mark
+- expert loop 后扫描未触及 token, 补零, 再 barrier
+- `#pragma omp barrier` 确保 zeroing 完成后再 reduction (修复竞态)
+
+### 首次实现 bug (R87a)
+遗漏 `#pragma omp barrier` 导致 2/8 次正确性失败 (RMSE 0.00269, 略超 0.002 阈值)。fast thread 在 slow thread zeroing 未完成时开始 reduction, 读取到 uninitialized y_acc。修复后 10/10 通过。
+
+### Grading 测试结果
+| 场景 | R62 评分(s) | R87 评分(s) | 变化 | 加速比 | 评分分数 |
+|------|------------|------------|------|--------|---------|
+| S3 | 0.09697 | 0.09226 | **-5.1%** | 71.69x | **101.0** (was 96.1) |
+| S4 | 1.46030 | 1.62843 | +11.5% (still maxed) | 141.08x | 120.0 |
+| S1 | 0.00769 | ~same (different code path) | - | 6.58x | 36.6 |
+| S2 | 0.03739 | ~same (different code path) | - | 16.48x | 42.3 |
+| **平均** | | | | | **75.0** (was 73.7) |
+
+### 成功原因
+1. S3 memset 128KB/thread 刷新 L1/L2, 导致 expert weight 重新从 L3 加载
+2. Lazy init 只在首次写入时 store (不需 read-modify-write), 减少 1 次 L1 load
+3. Post-loop zeroing 仅触及 ~50% untouched tokens (~64KB vs 128KB memset)
+4. Barrier 修复后正确性 10/10 通过
+
+### S4 影响分析
+S4 grading 慢 11.5% (1.46->1.63s), 但仍 141x >> 68x threshold, 评分仍 120.0。S4 regression 原因: 2MB/thread y_acc 的 post-loop zeroing + branch 开销 > memset savings。但 S4 已满分, 无影响。
+
+### 当前最佳版本: R87 (commit 3021939)
+| 场景 | 评分时间(s) | 加速比 | 评分分数 |
+|------|------------|--------|---------|
+| S1 | 0.00769 | 6.58x | 36.6 |
+| S2 | 0.03739 | 16.48x | 42.3 |
+| S3 | 0.09226 | 71.69x | 101.0 |
+| S4 | 1.62843 | 141.08x | 120.0 |
+| **平均** | | | **75.0** |
+
+### 下一步计划
+1. S1: 持久线程池 (std::thread + atomic spin-wait), 消除 fork/join
+2. S3: AMX TILE_N 16->32 (减少 A tile 加载)
+3. S4: 尝试恢复 memset for S4 (条件: ystride >= 阈值时用 memset, 否则 lazy)
+4. 低负载环境重测 R83 (AMX 2N tiling)
