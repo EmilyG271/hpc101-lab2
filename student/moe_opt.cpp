@@ -1713,7 +1713,9 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
         tl_scratch.ensure((size_t)max_count, (size_t)D, (size_t)H);
 
         float* y_acc = yacc_pool + (size_t)tid * ystride;
-        std::memset(y_acc, 0, ystride * sizeof(float));
+        // R87: Lazy y_acc init — skip full memset to preserve L2 cache state.
+        // Track first-write per token; zero untouched tokens after the expert loop.
+        char token_init[MAX_NUM_TOKENS] = {0};
 
 #pragma omp for schedule(dynamic)
         for (int ii = 0; ii < E; ++ii) {
@@ -1788,20 +1790,44 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
 #if defined(__AVX512F__)
                 const __m512 dequant_vec = _mm512_set1_ps(dequant);
                 const __m512 weight_vec = _mm512_set1_ps(route_weight);
-                for (int d = 0; d < D; d += 16) {
-                    const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
-                    const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
-                    const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
-                    const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
-                    const __m512 y_vec = _mm512_loadu_ps(y_t + d);
-                    _mm512_storeu_ps(y_t + d, _mm512_add_ps(y_vec, contribution));
+                if (token_init[t]) {
+                    for (int d = 0; d < D; d += 16) {
+                        const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
+                        const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+                        const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
+                        const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
+                        const __m512 y_vec = _mm512_loadu_ps(y_t + d);
+                        _mm512_storeu_ps(y_t + d, _mm512_add_ps(y_vec, contribution));
+                    }
+                } else {
+                    for (int d = 0; d < D; d += 16) {
+                        const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
+                        const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
+                        const __m512 dequantized = _mm512_mul_ps(out_fp32, dequant_vec);
+                        const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
+                        _mm512_storeu_ps(y_t + d, contribution);
+                    }
+                    token_init[t] = 1;
                 }
 #else
-                for (int d = 0; d < D; ++d)
-                    y_t[d] += route_weight * ((float)out_t[d] * dequant);
+                if (token_init[t]) {
+                    for (int d = 0; d < D; ++d)
+                        y_t[d] += route_weight * ((float)out_t[d] * dequant);
+                } else {
+                    for (int d = 0; d < D; ++d)
+                        y_t[d] = route_weight * ((float)out_t[d] * dequant);
+                    token_init[t] = 1;
+                }
 #endif
             }
         }
+
+        // R87: Zero untouched tokens for correct reduction, then barrier
+        for (int t = 0; t < num_tokens; ++t) {
+            if (!token_init[t])
+                std::memset(y_acc + (size_t)t * D, 0, D * sizeof(float));
+        }
+#pragma omp barrier
 
 // R18b: threshold-based y_acc reduction.
         // Large ystride (S4: 524288 elems=2MB/slice > L2): per-thread sequential pass
