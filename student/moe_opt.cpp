@@ -90,6 +90,9 @@ alignas(64) static int8_t
 static float g_scale_gate[MAX_NUM_EXPERTS];
 static float g_scale_up[MAX_NUM_EXPERTS];
 static float g_scale_down[MAX_NUM_EXPERTS];
+alignas(64) static int32_t g_sum_gate[MAX_NUM_EXPERTS][MAX_D_FF];
+alignas(64) static int32_t g_sum_up[MAX_NUM_EXPERTS][MAX_D_FF];
+alignas(64) static int32_t g_sum_down[MAX_NUM_EXPERTS][MAX_D_MODEL];
 
 alignas(64) static int8_t
     g_packed_shared_gate[MAX_D_MODEL * MAX_D_FF];
@@ -100,6 +103,9 @@ alignas(64) static int8_t
 static float g_scale_shared_gate;
 static float g_scale_shared_up;
 static float g_scale_shared_down;
+alignas(64) static int32_t g_sum_shared_gate[MAX_D_FF];
+alignas(64) static int32_t g_sum_shared_up[MAX_D_FF];
+alignas(64) static int32_t g_sum_shared_down[MAX_D_MODEL];
 
 // R10: Router 权重 FP16 存储（带宽降 2x，cvt 后 FP32 计算精度无损）
 alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
@@ -200,6 +206,16 @@ static void pack_output_major_weight(const int8_t* src, int8_t* packed,
     }
 }
 
+static void compute_output_major_row_sums(const int8_t* src, int32_t* sums,
+                                          int K, int N) {
+    for (int n = 0; n < N; ++n) {
+        int32_t sum = 0;
+        const int8_t* row = src + (size_t)n * K;
+        for (int k = 0; k < K; ++k) sum += (int32_t)row[k];
+        sums[n] = sum;
+    }
+}
+
 /**
  * @brief 为当前进程/线程申请使用 Intel AMX Tile 数据状态的权限。
  *
@@ -265,6 +281,12 @@ void preprocess(MoEWeights& w) {
                                  g_packed_up[e], D, H);
         pack_output_major_weight(w.w_down + (size_t)e * expert_elems,
                                  g_packed_down[e], H, D);
+        compute_output_major_row_sums(
+            w.w_gate + (size_t)e * expert_elems, g_sum_gate[e], D, H);
+        compute_output_major_row_sums(
+            w.w_up + (size_t)e * expert_elems, g_sum_up[e], D, H);
+        compute_output_major_row_sums(
+            w.w_down + (size_t)e * expert_elems, g_sum_down[e], H, D);
         g_scale_gate[e] = w.s_gate[e];
         g_scale_up[e] = w.s_up[e];
         g_scale_down[e] = w.s_down[e];
@@ -273,6 +295,12 @@ void preprocess(MoEWeights& w) {
     pack_output_major_weight(w.sh_gate, g_packed_shared_gate, D, H);
     pack_output_major_weight(w.sh_up, g_packed_shared_up, D, H);
     pack_output_major_weight(w.sh_down, g_packed_shared_down, H, D);
+    compute_output_major_row_sums(
+        w.sh_gate, g_sum_shared_gate, D, H);
+    compute_output_major_row_sums(
+        w.sh_up, g_sum_shared_up, D, H);
+    compute_output_major_row_sums(
+        w.sh_down, g_sum_shared_down, H, D);
     g_scale_shared_gate = w.sh_s_gate;
     g_scale_shared_up = w.sh_s_up;
     g_scale_shared_down = w.sh_s_down;
@@ -665,7 +693,40 @@ static inline bool should_use_small_m_kernel(int M, int K, int N) {
 
 static void small_m_gate_up_output_major(
     const int8_t* A, const int8_t* W_gate, const int8_t* W_up,
+    const int32_t* sum_gate, const int32_t* sum_up,
     int32_t* C_gate, int32_t* C_up, int M, int K, int N) {
+#if defined(__AVX512VNNI__)
+    if (M == 1) {
+        const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+        for (int n0 = 0; n0 < N; n0 += 8) {
+            __m512i gate_acc[8];
+            __m512i up_acc[8];
+            for (int j = 0; j < 8; ++j) {
+                gate_acc[j] = _mm512_setzero_si512();
+                up_acc[j] = _mm512_setzero_si512();
+            }
+            for (int k0 = 0; k0 < K; k0 += 64) {
+                const __m512i a_u8 = _mm512_xor_si512(
+                    _mm512_loadu_si512(A + k0), sign_flip);
+                for (int j = 0; j < 8; ++j) {
+                    const __m512i wg = _mm512_loadu_si512(
+                        W_gate + (size_t)(n0 + j) * K + k0);
+                    const __m512i wu = _mm512_loadu_si512(
+                        W_up + (size_t)(n0 + j) * K + k0);
+                    gate_acc[j] = _mm512_dpbusd_epi32(gate_acc[j], a_u8, wg);
+                    up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
+                }
+            }
+            for (int j = 0; j < 8; ++j) {
+                C_gate[n0 + j] =
+                    _mm512_reduce_add_epi32(gate_acc[j]) - 128 * sum_gate[n0 + j];
+                C_up[n0 + j] =
+                    _mm512_reduce_add_epi32(up_acc[j]) - 128 * sum_up[n0 + j];
+            }
+        }
+        return;
+    }
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     for (int m = 0; m < M; ++m) {
         const int8_t* a_row = A + (size_t)m * K;
@@ -724,8 +785,31 @@ static void small_m_gate_up_output_major(
 }
 
 static void small_m_matmul_output_major(
-    const int8_t* A, const int8_t* W, int32_t* C,
+    const int8_t* A, const int8_t* W, const int32_t* row_sums, int32_t* C,
     int M, int K, int N) {
+#if defined(__AVX512VNNI__)
+    if (M == 1) {
+        const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+        for (int n0 = 0; n0 < N; n0 += 8) {
+            __m512i acc[8];
+            for (int j = 0; j < 8; ++j) acc[j] = _mm512_setzero_si512();
+            for (int k0 = 0; k0 < K; k0 += 64) {
+                const __m512i a_u8 = _mm512_xor_si512(
+                    _mm512_loadu_si512(A + k0), sign_flip);
+                for (int j = 0; j < 8; ++j) {
+                    const __m512i wv = _mm512_loadu_si512(
+                        W + (size_t)(n0 + j) * K + k0);
+                    acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
+                }
+            }
+            for (int j = 0; j < 8; ++j) {
+                C[n0 + j] =
+                    _mm512_reduce_add_epi32(acc[j]) - 128 * row_sums[n0 + j];
+            }
+        }
+        return;
+    }
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     for (int m = 0; m < M; ++m) {
         const int8_t* a_row = A + (size_t)m * K;
@@ -977,11 +1061,12 @@ static void matmul_gate_up(
     const int8_t* A,
     const int8_t* B_gate_pack, const int8_t* B_up_pack,
     const int8_t* W_gate, const int8_t* W_up,
+    const int32_t* sum_gate, const int32_t* sum_up,
     int32_t* C_gate, int32_t* C_up,
     int M, int K, int N) {
     if (should_use_small_m_kernel(M, K, N)) {
         small_m_gate_up_output_major(
-            A, W_gate, W_up, C_gate, C_up, M, K, N);
+            A, W_gate, W_up, sum_gate, sum_up, C_gate, C_up, M, K, N);
         return;
     }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -1000,9 +1085,10 @@ static void matmul_gate_up(
 // 否则保持打包 AMX 路径。
 static void matmul_small_m_or_packed(
     const int8_t* A, const int8_t* B_pack, const int8_t* W,
+    const int32_t* row_sums,
     int32_t* C, int M, int K, int N) {
     if (should_use_small_m_kernel(M, K, N)) {
-        small_m_matmul_output_major(A, W, C, M, K, N);
+        small_m_matmul_output_major(A, W, row_sums, C, M, K, N);
         return;
     }
     matmul_packed(A, B_pack, C, M, K, N);
@@ -1052,6 +1138,7 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
                 g_quantized_x + (size_t)t0 * D,
                 g_packed_shared_gate, g_packed_shared_up,
                 w.sh_gate, w.sh_up,
+                g_sum_shared_gate, g_sum_shared_up,
                 g_shared_gate_out + (size_t)t0 * H,
                 g_shared_up_out + (size_t)t0 * H,
                 m, D, H);
@@ -1095,7 +1182,7 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
 #endif
         g_shared_gated_scale[t] =
             quantize_hidden_row(h_row, hq_row, H, max_abs);
-    
+
         }
 
         // --- Down GEMM (16-token blocks) ---
@@ -1105,6 +1192,7 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
             matmul_small_m_or_packed(
                 g_shared_quantized_gated + (size_t)t0 * H,
                 g_packed_shared_down, w.sh_down,
+                g_sum_shared_down,
                 g_shared_down_out + (size_t)t0 * D,
                 m, H, D);
         }
@@ -1131,7 +1219,7 @@ static void compute_shared_expert(const float* x, const MoEWeights& w,
             y_t[d] = x_t[d] + (float)out_t[d] * dequant;
         }
 #endif
-    
+
         }
     }
 }
@@ -1203,6 +1291,7 @@ static void compute_single_token_routed_experts_parallel(
             if (use_small_gate_up) {
                 small_m_gate_up_output_major(
                     xq, w_gate_e, w_up_e,
+                    g_sum_gate[e], g_sum_up[e],
                     tl_scratch.gate_out, tl_scratch.up_out, 1, D, H);
             } else {
                 matmul_packed(xq, g_packed_gate[e], tl_scratch.gate_out, 1, D, H);
@@ -1242,7 +1331,8 @@ static void compute_single_token_routed_experts_parallel(
 
             if (use_small_down) {
                 small_m_matmul_output_major(
-                    tl_scratch.quantized_gated, w_down_e, tl_scratch.down_out, 1, H, D);
+                    tl_scratch.quantized_gated, w_down_e, g_sum_down[e],
+                    tl_scratch.down_out, 1, H, D);
             } else {
                 matmul_packed(tl_scratch.quantized_gated, g_packed_down[e],
                               tl_scratch.down_out, 1, H, D);
@@ -1309,6 +1399,7 @@ static void compute_single_token_routed_experts(
         if (use_small_gate_up) {
             small_m_gate_up_output_major(
                 xq, w_gate_e, w_up_e,
+                g_sum_gate[e], g_sum_up[e],
                 g_gate_out, g_up_out, 1, D, H);
         } else {
             // S1 直接进入分离 AMX/标量打包 kernel，跳过通用分派判断。
@@ -1347,7 +1438,8 @@ static void compute_single_token_routed_experts(
 
         if (use_small_down) {
             small_m_matmul_output_major(
-                g_quantized_gated, w_down_e, g_down_out, 1, H, D);
+                g_quantized_gated, w_down_e, g_sum_down[e],
+                g_down_out, 1, H, D);
         } else {
             matmul_packed(
                 g_quantized_gated, g_packed_down[e],
@@ -1457,6 +1549,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
 
             matmul_gate_up(A, g_packed_gate[e], g_packed_up[e],
                            w_gate_e, w_up_e,
+                           g_sum_gate[e], g_sum_up[e],
                            tl_scratch.gate_out, tl_scratch.up_out,
                            count, D, H);
 
@@ -1498,6 +1591,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
 
             matmul_small_m_or_packed(
                 tl_scratch.quantized_gated, g_packed_down[e], w_down_e,
+                g_sum_down[e],
                 tl_scratch.down_out, count, H, D);
 
             for (int i = 0; i < count; ++i) {
@@ -1807,6 +1901,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             g_amx_A,
             g_packed_gate[e], g_packed_up[e],
             w_gate_e, w_up_e,
+            g_sum_gate[e], g_sum_up[e],
             g_gate_out, g_up_out,
             count, D, H);
 
@@ -1849,6 +1944,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 
         matmul_small_m_or_packed(
             g_quantized_gated, g_packed_down[e], w_down_e,
+            g_sum_down[e],
             g_down_out, count, H, D);
 
         for (int i = 0; i < count; ++i) {
