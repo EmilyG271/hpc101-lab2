@@ -1276,10 +1276,10 @@ alignas(64) static int8_t g_s2_hidden_q[5][MAX_D_FF];
 static float g_s2_hidden_scale[5];
 alignas(64) static int32_t g_s2_down[5][MAX_D_MODEL];
 
-static void s2_gate_up_range(const int8_t* xq, const int8_t* w_gate,
-                             const int8_t* w_up, const int32_t* sum_gate,
-                             const int32_t* sum_up, int32_t* gate_out,
-                             int32_t* up_out, int D, int begin, int end) {
+static inline void s2_gate_up_range(
+    const int8_t* xq, const int8_t* w_gate, const int8_t* w_up,
+    const int32_t* sum_gate, const int32_t* sum_up, int32_t* gate_out,
+    int32_t* up_out, int begin, int end) {
     const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
     for (int n0 = begin; n0 < end; n0 += 8) {
         __m512i gate_acc[8];
@@ -1288,14 +1288,14 @@ static void s2_gate_up_range(const int8_t* xq, const int8_t* w_gate,
             gate_acc[j] = _mm512_setzero_si512();
             up_acc[j] = _mm512_setzero_si512();
         }
-        for (int k0 = 0; k0 < D; k0 += 64) {
+        for (int k0 = 0; k0 < 1024; k0 += 64) {
             const __m512i a_u8 = _mm512_xor_si512(
                 _mm512_loadu_si512(xq + k0), sign_flip);
             for (int j = 0; j < 8; ++j) {
                 const __m512i wg = _mm512_loadu_si512(
-                    w_gate + (size_t)(n0 + j) * D + k0);
+                    w_gate + (size_t)(n0 + j) * 1024 + k0);
                 const __m512i wu = _mm512_loadu_si512(
-                    w_up + (size_t)(n0 + j) * D + k0);
+                    w_up + (size_t)(n0 + j) * 1024 + k0);
                 gate_acc[j] = _mm512_dpbusd_epi32(gate_acc[j], a_u8, wg);
                 up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
             }
@@ -1309,19 +1309,19 @@ static void s2_gate_up_range(const int8_t* xq, const int8_t* w_gate,
     }
 }
 
-static void s2_down_range(const int8_t* hq, const int8_t* w_down,
-                          const int32_t* row_sums, int32_t* down_out,
-                          int H, int begin, int end) {
+static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
+                                 const int32_t* row_sums, int32_t* down_out,
+                                 int begin, int end) {
     const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
     for (int n0 = begin; n0 < end; n0 += 8) {
         __m512i acc[8];
         for (int j = 0; j < 8; ++j) acc[j] = _mm512_setzero_si512();
-        for (int k0 = 0; k0 < H; k0 += 64) {
+        for (int k0 = 0; k0 < 512; k0 += 64) {
             const __m512i a_u8 = _mm512_xor_si512(
                 _mm512_loadu_si512(hq + k0), sign_flip);
             for (int j = 0; j < 8; ++j) {
                 const __m512i wv = _mm512_loadu_si512(
-                    w_down + (size_t)(n0 + j) * H + k0);
+                    w_down + (size_t)(n0 + j) * 512 + k0);
                 acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
             }
         }
@@ -1375,7 +1375,7 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
         const int slot = tid / NUM_CHUNKS;
         const int chunk = tid % NUM_CHUNKS;
         s2_gate_up_range(xq, gate_w[slot], up_w[slot], gate_sum[slot],
-                         up_sum[slot], g_s2_gate[slot], g_s2_up[slot], D,
+                         up_sum[slot], g_s2_gate[slot], g_s2_up[slot],
                          H_BOUNDS[chunk], H_BOUNDS[chunk + 1]);
 #pragma omp barrier
         if (tid < NUM_EXPERTS) {
@@ -1399,7 +1399,7 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
         }
 #pragma omp barrier
         s2_down_range(g_s2_hidden_q[slot], down_w[slot], down_sum[slot],
-                      g_s2_down[slot], H, D_BOUNDS[chunk],
+                      g_s2_down[slot], D_BOUNDS[chunk],
                       D_BOUNDS[chunk + 1]);
     }
 
