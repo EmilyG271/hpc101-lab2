@@ -1284,8 +1284,8 @@ static void compute_single_token_routed_experts_parallel(
             tl_scratch.amx_perm = request_amx_permission();
         tl_scratch.ensure(1, (size_t)D, (size_t)H);
 
-#pragma omp for schedule(static)
-        for (int task = 0; task < num_tasks; ++task) {
+        const int tid = omp_get_thread_num();
+        for (int task = tid; task < num_tasks; task += nt) {
             const bool shared = task == 0;
             const int e = shared ? -1 : g_topk_indices[0][task - 1];
             const float route_weight = shared ? 1.0f : g_topk_weights[0][task - 1];
