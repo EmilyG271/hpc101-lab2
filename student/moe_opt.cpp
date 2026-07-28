@@ -163,6 +163,11 @@ alignas(64) static int8_t g_packed_router[MAX_D_MODEL * MAX_NUM_EXPERTS];
 static float g_scale_router[MAX_NUM_EXPERTS];
 // R134: 128 × per-expert router row-sum (for INT8 VNNI routing correction)
 static int32_t g_sum_router_128[MAX_NUM_EXPERTS];
+// R137: interleaved VNNI-broadcast router for S1 single-ZMM routing.
+// Layout: [4-input group g][16 outputs x 4 bytes] (64 B/group). One VPDPBUSD
+// per group computes all 16 expert logits in one ZMM lane each, eliminating
+// the 16 zmm_hsum_i32 horizontal reductions the generic kernel needed.
+alignas(64) static int8_t g_router_vnni[16 * MAX_D_MODEL];
 alignas(64) static int32_t g_router_logits[MAX_NUM_TOKENS * MAX_NUM_EXPERTS];
 
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -454,6 +459,17 @@ void preprocess(MoEWeights& w) {
     pack_output_major_weight(g_router_int8, g_packed_router, D, E);
     // R134: precompute 128 × row-sum for INT8 VNNI routing
     compute_output_major_row_sums(g_router_int8, g_sum_router_128, D, E);
+    // R137: build interleaved VNNI-broadcast router for S1 single-ZMM routing.
+    if (E <= 16) {
+        for (int g = 0; g < D / 4; ++g) {
+            int8_t* dst = g_router_vnni + (size_t)g * 64;
+            for (int e = 0; e < E; ++e)
+                std::memcpy(dst + (size_t)e * 4,
+                             g_router_int8 + (size_t)e * D + g * 4, 4);
+            for (int e = E; e < 16; ++e)
+                std::memset(dst + (size_t)e * 4, 0, 4);
+        }
+    }
 
     g_amx_runtime_enabled = request_amx_permission();
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -620,9 +636,33 @@ static inline void compute_routing_int8_vnni(int t, const float* x,
                                               int D, int E, int K) {
     const float x_scale = g_x_scale[t];
     int32_t logits_i32[16];
-    small_m_matmul_output_major(
-        g_quantized_x + (size_t)t * D, g_router_int8,
-        g_sum_router_128, logits_i32, 1, D, E);
+#if defined(__AVX512VNNI__) && defined(__AVX512F__)
+    if (E == 16) {
+        // R137: single-ZMM broadcast routing - one VPDPBUSD per 4 inputs
+        // produces all 16 expert logits (one per ZMM lane), eliminating the
+        // 16 zmm_hsum_i32 horizontal reductions of the generic kernel.
+        const int8_t* a = g_quantized_x + (size_t)t * D;
+        const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+        __m512i acc = _mm512_setzero_si512();
+        for (int g = 0; g < D / 4; ++g) {
+            uint32_t word;
+            std::memcpy(&word, a + 4 * g, 4);
+            __m512i av = _mm512_xor_si512(
+                _mm512_set1_epi32((int32_t)word), sign_flip);
+            acc = _mm512_dpbusd_epi32(
+                acc, av, _mm512_loadu_si512(
+                            reinterpret_cast<const __m512i*>(
+                                g_router_vnni + (size_t)g * 64)));
+        }
+        acc = _mm512_sub_epi32(acc, _mm512_loadu_si512(g_sum_router_128));
+        _mm512_storeu_si512(logits_i32, acc);
+    } else
+#endif
+    {
+        small_m_matmul_output_major(
+            g_quantized_x + (size_t)t * D, g_router_int8,
+            g_sum_router_128, logits_i32, 1, D, E);
+    }
 
     int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
     float best_affinity[MAX_TOP_K] = {};
@@ -2515,7 +2555,36 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     // Skips omp_set_num_threads, s2_split check, and wrapper overhead.
     // R134: S1 fast path with INT8 VNNI routing.
     if (num_tokens == 1 && D == S1_PACK_D && H == S1_PACK_H && K >= 2) {
+        // R139: One-pass quantization - buffer x in ZMM registers during the
+        // max-abs scan so the conversion pass reads from registers (or L1
+        // spill) instead of re-loading x from L2. Saves ~224 cyc on S1.
+#if defined(__AVX512F__)
+        {
+            const float* x_t = x;
+            int8_t* q_t = g_quantized_x;
+            __m512 xb[16];
+            __m512 vmax = _mm512_setzero_ps();
+            for (int d = 0; d < 256; d += 16) {
+                xb[d >> 4] = _mm512_loadu_ps(x_t + d);
+                vmax = _mm512_max_ps(vmax, _mm512_abs_ps(xb[d >> 4]));
+            }
+            const float max_abs = _mm512_reduce_max_ps(vmax);
+            const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+            g_x_scale[0] = scale;
+            const __m512 invs = _mm512_set1_ps(1.0f / scale);
+            const __m512 lo = _mm512_set1_ps(-127.0f);
+            const __m512 hi = _mm512_set1_ps(127.0f);
+            for (int d = 0; d < 256; d += 16) {
+                __m512 q = _mm512_mul_ps(xb[d >> 4], invs);
+                q = _mm512_roundscale_ps(q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                q = _mm512_min_ps(hi, _mm512_max_ps(lo, q));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q_t + d),
+                    _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(q)));
+            }
+        }
+#else
         quantize_input(x, 1, D);
+#endif
         compute_routing_int8_vnni(0, x, w, D, E, K);
         compute_single_token_routed_experts_parallel(x, w, y, D, H, K, K + 1);
         return;
