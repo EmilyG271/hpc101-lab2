@@ -133,6 +133,22 @@ alignas(64) static int32_t g_sum_shared_gate[MAX_D_FF];
 alignas(64) static int32_t g_sum_shared_up[MAX_D_FF];
 alignas(64) static int32_t g_sum_shared_down[MAX_D_MODEL];
 
+// R126: S1-only blocked VNNI layout. Each 16-output block stores all K/4
+// groups contiguously, so VPDPBUSD produces 16 final output channels directly
+// and avoids a horizontal reduction for every scalar output.
+static constexpr int S1_PACK_E = 16;
+static constexpr int S1_PACK_D = 256;
+static constexpr int S1_PACK_H = 128;
+alignas(64) static int8_t
+    g_s1_gate[S1_PACK_E][S1_PACK_D * S1_PACK_H];
+alignas(64) static int8_t
+    g_s1_up[S1_PACK_E][S1_PACK_D * S1_PACK_H];
+alignas(64) static int8_t
+    g_s1_down[S1_PACK_E][S1_PACK_D * S1_PACK_H];
+alignas(64) static int8_t g_s1_shared_gate[S1_PACK_D * S1_PACK_H];
+alignas(64) static int8_t g_s1_shared_up[S1_PACK_D * S1_PACK_H];
+alignas(64) static int8_t g_s1_shared_down[S1_PACK_D * S1_PACK_H];
+
 // R10: Router 权重 FP16 存储（带宽降 2x，cvt 后 FP32 计算精度无损）
 alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
 
@@ -249,13 +265,27 @@ static void pack_output_major_weight(const int8_t* src, int8_t* packed,
     }
 }
 
+static void pack_s1_output_blocks(const int8_t* src, int8_t* packed,
+                                  int K, int N) {
+    for (int n0 = 0; n0 < N; n0 += 16) {
+        int8_t* block = packed + (size_t)n0 * K;
+        for (int k4 = 0; k4 < K / 4; ++k4) {
+            int8_t* dst = block + (size_t)k4 * 64;
+            for (int n = 0; n < 16; ++n) {
+                std::memcpy(dst + 4 * n,
+                            src + (size_t)(n0 + n) * K + 4 * k4, 4);
+            }
+        }
+    }
+}
+
 static void compute_output_major_row_sums(const int8_t* src, int32_t* sums,
                                           int K, int N) {
     for (int n = 0; n < N; ++n) {
         int32_t sum = 0;
         const int8_t* row = src + (size_t)n * K;
         for (int k = 0; k < K; ++k) sum += (int32_t)row[k];
-        sums[n] = sum;
+        sums[n] = sum * 128;
     }
 }
 
@@ -330,6 +360,14 @@ void preprocess(MoEWeights& w) {
             w.w_up + (size_t)e * expert_elems, g_sum_up[e], D, H);
         compute_output_major_row_sums(
             w.w_down + (size_t)e * expert_elems, g_sum_down[e], H, D);
+        if (D == S1_PACK_D && H == S1_PACK_H && E <= S1_PACK_E) {
+            pack_s1_output_blocks(
+                w.w_gate + (size_t)e * expert_elems, g_s1_gate[e], D, H);
+            pack_s1_output_blocks(
+                w.w_up + (size_t)e * expert_elems, g_s1_up[e], D, H);
+            pack_s1_output_blocks(
+                w.w_down + (size_t)e * expert_elems, g_s1_down[e], H, D);
+        }
         g_scale_gate[e] = w.s_gate[e];
         g_scale_up[e] = w.s_up[e];
         g_scale_down[e] = w.s_down[e];
@@ -344,6 +382,11 @@ void preprocess(MoEWeights& w) {
         w.sh_up, g_sum_shared_up, D, H);
     compute_output_major_row_sums(
         w.sh_down, g_sum_shared_down, H, D);
+    if (D == S1_PACK_D && H == S1_PACK_H && E <= S1_PACK_E) {
+        pack_s1_output_blocks(w.sh_gate, g_s1_shared_gate, D, H);
+        pack_s1_output_blocks(w.sh_up, g_s1_shared_up, D, H);
+        pack_s1_output_blocks(w.sh_down, g_s1_shared_down, H, D);
+    }
     g_scale_shared_gate = w.sh_s_gate;
     g_scale_shared_up = w.sh_s_up;
     g_scale_shared_down = w.sh_s_down;
@@ -519,7 +562,7 @@ static inline void compute_routing_token(int t, const float* x, const MoEWeights
             __m512 neg_lv = _mm512_xor_ps(lv, _mm512_set1_ps(-0.0f));
             __m512 exp_v = exp512_ps(neg_lv);
             __m512 one_v = _mm512_set1_ps(1.0f);
-            __m512 aff_v = _mm512_div_ps(one_v, _mm512_add_ps(one_v, exp_v));
+            __m512 aff_v = _mm512_rcp14_ps(_mm512_add_ps(one_v, exp_v));
             float affinities[4];
             _mm_storeu_ps(affinities, _mm512_castps512_ps128(aff_v));
             for (int j = 0; j < 4; ++j) {
@@ -740,6 +783,101 @@ static inline bool should_use_small_m_kernel(int M, int K, int N) {
            (size_t)K * (size_t)N >= SMALL_M_WORK_THRESHOLD;
 }
 
+#if defined(__AVX512VNNI__) && defined(__GNUC__)
+static inline __m512i dpbusd_accumulate_mem(
+    __m512i accumulator, __m512i activations, const int8_t* weights) {
+    asm("vpdpbusd %2, %1, %0"
+        : "+v"(accumulator)
+        : "v"(activations),
+          "m"(*reinterpret_cast<const __m512i*>(weights)));
+    return accumulator;
+}
+#endif
+
+static inline __m512i s1_broadcast_u8x4(const int8_t* input) {
+    uint32_t word;
+    std::memcpy(&word, input, sizeof(word));
+    return _mm512_set1_epi32((int32_t)(word ^ 0x80808080u));
+}
+
+static inline void s1_blocked_gate_up(
+    const int8_t* A, const int8_t* W_gate, const int8_t* W_up,
+    const int32_t* sum_gate, const int32_t* sum_up,
+    int32_t* C_gate, int32_t* C_up, int K, int N) {
+    for (int n0 = 0; n0 < N; n0 += 16) {
+        __m512i gate0 = _mm512_setzero_si512();
+        __m512i gate1 = _mm512_setzero_si512();
+        __m512i gate2 = _mm512_setzero_si512();
+        __m512i gate3 = _mm512_setzero_si512();
+        __m512i up0 = _mm512_setzero_si512();
+        __m512i up1 = _mm512_setzero_si512();
+        __m512i up2 = _mm512_setzero_si512();
+        __m512i up3 = _mm512_setzero_si512();
+        const int8_t* gate_block = W_gate + (size_t)n0 * K;
+        const int8_t* up_block = W_up + (size_t)n0 * K;
+        for (int k4 = 0; k4 < K / 4; k4 += 4) {
+            __m512i activations = s1_broadcast_u8x4(A + 4 * k4);
+            gate0 = dpbusd_accumulate_mem(
+                gate0, activations, gate_block + (size_t)(k4 + 0) * 64);
+            up0 = dpbusd_accumulate_mem(
+                up0, activations, up_block + (size_t)(k4 + 0) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 1));
+            gate1 = dpbusd_accumulate_mem(
+                gate1, activations, gate_block + (size_t)(k4 + 1) * 64);
+            up1 = dpbusd_accumulate_mem(
+                up1, activations, up_block + (size_t)(k4 + 1) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 2));
+            gate2 = dpbusd_accumulate_mem(
+                gate2, activations, gate_block + (size_t)(k4 + 2) * 64);
+            up2 = dpbusd_accumulate_mem(
+                up2, activations, up_block + (size_t)(k4 + 2) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 3));
+            gate3 = dpbusd_accumulate_mem(
+                gate3, activations, gate_block + (size_t)(k4 + 3) * 64);
+            up3 = dpbusd_accumulate_mem(
+                up3, activations, up_block + (size_t)(k4 + 3) * 64);
+        }
+        __m512i gate = _mm512_add_epi32(
+            _mm512_add_epi32(gate0, gate1), _mm512_add_epi32(gate2, gate3));
+        __m512i up = _mm512_add_epi32(
+            _mm512_add_epi32(up0, up1), _mm512_add_epi32(up2, up3));
+        gate = _mm512_sub_epi32(gate, _mm512_load_si512(sum_gate + n0));
+        up = _mm512_sub_epi32(up, _mm512_load_si512(sum_up + n0));
+        _mm512_store_si512(C_gate + n0, gate);
+        _mm512_store_si512(C_up + n0, up);
+    }
+}
+
+static inline void s1_blocked_matmul(
+    const int8_t* A, const int8_t* W, const int32_t* row_sums,
+    int32_t* C, int K, int N) {
+    for (int n0 = 0; n0 < N; n0 += 16) {
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512();
+        __m512i acc3 = _mm512_setzero_si512();
+        const int8_t* block = W + (size_t)n0 * K;
+        for (int k4 = 0; k4 < K / 4; k4 += 4) {
+            __m512i activations = s1_broadcast_u8x4(A + 4 * k4);
+            acc0 = dpbusd_accumulate_mem(
+                acc0, activations, block + (size_t)(k4 + 0) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 1));
+            acc1 = dpbusd_accumulate_mem(
+                acc1, activations, block + (size_t)(k4 + 1) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 2));
+            acc2 = dpbusd_accumulate_mem(
+                acc2, activations, block + (size_t)(k4 + 2) * 64);
+            activations = s1_broadcast_u8x4(A + 4 * (k4 + 3));
+            acc3 = dpbusd_accumulate_mem(
+                acc3, activations, block + (size_t)(k4 + 3) * 64);
+        }
+        __m512i acc = _mm512_add_epi32(
+            _mm512_add_epi32(acc0, acc1), _mm512_add_epi32(acc2, acc3));
+        acc = _mm512_sub_epi32(acc, _mm512_load_si512(row_sums + n0));
+        _mm512_store_si512(C + n0, acc);
+    }
+}
+
 static void small_m_gate_up_output_major(
     const int8_t* A, const int8_t* W_gate, const int8_t* W_up,
     const int32_t* sum_gate, const int32_t* sum_up,
@@ -747,31 +885,37 @@ static void small_m_gate_up_output_major(
 #if defined(__AVX512VNNI__)
     if (M == 1) {
         const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
-        for (int n0 = 0; n0 < N; n0 += 2) {
-            __m512i gate_acc[2];
-            __m512i up_acc[2];
-            for (int j = 0; j < 2; ++j) {
-                gate_acc[j] = _mm512_setzero_si512();
-                up_acc[j] = _mm512_setzero_si512();
-            }
+        for (int n0 = 0; n0 < N; n0 += 4) {
+            __m512i gate0 = _mm512_setzero_si512();
+            __m512i gate1 = _mm512_setzero_si512();
+            __m512i gate2 = _mm512_setzero_si512();
+            __m512i gate3 = _mm512_setzero_si512();
+            __m512i up0 = _mm512_setzero_si512();
+            __m512i up1 = _mm512_setzero_si512();
+            __m512i up2 = _mm512_setzero_si512();
+            __m512i up3 = _mm512_setzero_si512();
+            const int8_t* gate0_w = W_gate + (size_t)n0 * K;
+            const int8_t* up0_w = W_up + (size_t)n0 * K;
             for (int k0 = 0; k0 < K; k0 += 64) {
                 const __m512i a_u8 = _mm512_xor_si512(
                     _mm512_loadu_si512(A + k0), sign_flip);
-                for (int j = 0; j < 2; ++j) {
-                    const __m512i wg = _mm512_loadu_si512(
-                        W_gate + (size_t)(n0 + j) * K + k0);
-                    const __m512i wu = _mm512_loadu_si512(
-                        W_up + (size_t)(n0 + j) * K + k0);
-                    gate_acc[j] = _mm512_dpbusd_epi32(gate_acc[j], a_u8, wg);
-                    up_acc[j] = _mm512_dpbusd_epi32(up_acc[j], a_u8, wu);
-                }
+                gate0 = dpbusd_accumulate_mem(gate0, a_u8, gate0_w + k0);
+                up0 = dpbusd_accumulate_mem(up0, a_u8, up0_w + k0);
+                gate1 = dpbusd_accumulate_mem(gate1, a_u8, gate0_w + K + k0);
+                up1 = dpbusd_accumulate_mem(up1, a_u8, up0_w + K + k0);
+                gate2 = dpbusd_accumulate_mem(gate2, a_u8, gate0_w + 2 * K + k0);
+                up2 = dpbusd_accumulate_mem(up2, a_u8, up0_w + 2 * K + k0);
+                gate3 = dpbusd_accumulate_mem(gate3, a_u8, gate0_w + 3 * K + k0);
+                up3 = dpbusd_accumulate_mem(up3, a_u8, up0_w + 3 * K + k0);
             }
-           for (int j = 0; j < 2; ++j) {
-               C_gate[n0 + j] =
-                   zmm_hsum_i32(gate_acc[j]) - 128 * sum_gate[n0 + j];
-               C_up[n0 + j] =
-                   zmm_hsum_i32(up_acc[j]) - 128 * sum_up[n0 + j];
-           }
+            C_gate[n0 + 0] = zmm_hsum_i32(gate0) - sum_gate[n0 + 0];
+            C_up[n0 + 0] = zmm_hsum_i32(up0) - sum_up[n0 + 0];
+            C_gate[n0 + 1] = zmm_hsum_i32(gate1) - sum_gate[n0 + 1];
+            C_up[n0 + 1] = zmm_hsum_i32(up1) - sum_up[n0 + 1];
+            C_gate[n0 + 2] = zmm_hsum_i32(gate2) - sum_gate[n0 + 2];
+            C_up[n0 + 2] = zmm_hsum_i32(up2) - sum_up[n0 + 2];
+            C_gate[n0 + 3] = zmm_hsum_i32(gate3) - sum_gate[n0 + 3];
+            C_up[n0 + 3] = zmm_hsum_i32(up3) - sum_up[n0 + 3];
         }
         return;
     }
@@ -840,23 +984,37 @@ static void small_m_matmul_output_major(
     if (M == 1) {
         const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
         for (int n0 = 0; n0 < N; n0 += 8) {
-            __m512i acc[8];
-            for (int j = 0; j < 8; ++j) acc[j] = _mm512_setzero_si512();
+            __m512i acc0 = _mm512_setzero_si512();
+            __m512i acc1 = _mm512_setzero_si512();
+            __m512i acc2 = _mm512_setzero_si512();
+            __m512i acc3 = _mm512_setzero_si512();
+            __m512i acc4 = _mm512_setzero_si512();
+            __m512i acc5 = _mm512_setzero_si512();
+            __m512i acc6 = _mm512_setzero_si512();
+            __m512i acc7 = _mm512_setzero_si512();
+            const int8_t* w0 = W + (size_t)n0 * K;
             for (int k0 = 0; k0 < K; k0 += 64) {
                 const __m512i a_u8 = _mm512_xor_si512(
                     _mm512_loadu_si512(A + k0), sign_flip);
-                for (int j = 0; j < 8; ++j) {
-                    const __m512i wv = _mm512_loadu_si512(
-                        W + (size_t)(n0 + j) * K + k0);
-                    acc[j] = _mm512_dpbusd_epi32(acc[j], a_u8, wv);
-                }
+                acc0 = dpbusd_accumulate_mem(acc0, a_u8, w0 + k0);
+                acc1 = dpbusd_accumulate_mem(acc1, a_u8, w0 + K + k0);
+                acc2 = dpbusd_accumulate_mem(acc2, a_u8, w0 + 2 * K + k0);
+                acc3 = dpbusd_accumulate_mem(acc3, a_u8, w0 + 3 * K + k0);
+                acc4 = dpbusd_accumulate_mem(acc4, a_u8, w0 + 4 * K + k0);
+                acc5 = dpbusd_accumulate_mem(acc5, a_u8, w0 + 5 * K + k0);
+                acc6 = dpbusd_accumulate_mem(acc6, a_u8, w0 + 6 * K + k0);
+                acc7 = dpbusd_accumulate_mem(acc7, a_u8, w0 + 7 * K + k0);
             }
-            for (int j = 0; j < 8; ++j) {
-               C[n0 + j] =
-                   zmm_hsum_i32(acc[j]) - 128 * row_sums[n0 + j];
-           }
-       }
-       return;
+            C[n0 + 0] = zmm_hsum_i32(acc0) - row_sums[n0 + 0];
+            C[n0 + 1] = zmm_hsum_i32(acc1) - row_sums[n0 + 1];
+            C[n0 + 2] = zmm_hsum_i32(acc2) - row_sums[n0 + 2];
+            C[n0 + 3] = zmm_hsum_i32(acc3) - row_sums[n0 + 3];
+            C[n0 + 4] = zmm_hsum_i32(acc4) - row_sums[n0 + 4];
+            C[n0 + 5] = zmm_hsum_i32(acc5) - row_sums[n0 + 5];
+            C[n0 + 6] = zmm_hsum_i32(acc6) - row_sums[n0 + 6];
+            C[n0 + 7] = zmm_hsum_i32(acc7) - row_sums[n0 + 7];
+        }
+        return;
     }
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -1370,9 +1528,9 @@ static inline void s2_gate_up_range(
         }
        for (int j = 0; j < 4; ++j) {
            gate_out[n0 + j] = _mm512_reduce_add_epi32(gate_acc[j]) -
-                              128 * sum_gate[n0 + j];
+                              sum_gate[n0 + j];
            up_out[n0 + j] = _mm512_reduce_add_epi32(up_acc[j]) -
-                            128 * sum_up[n0 + j];
+                            sum_up[n0 + j];
        }
     }
 }
@@ -1395,7 +1553,7 @@ static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
         }
        for (int j = 0; j < 4; ++j) {
            down_out[n0 + j] = _mm512_reduce_add_epi32(acc[j]) -
-                               128 * row_sums[n0 + j];
+                               row_sums[n0 + j];
        }
     }
 }
@@ -1519,8 +1677,16 @@ static inline void s1_exec_task(
     const float weight_scale_gate = shared ? g_scale_shared_gate : g_scale_gate[e];
     const float weight_scale_up = shared ? g_scale_shared_up : g_scale_up[e];
     const float weight_scale_down = shared ? g_scale_shared_down : g_scale_down[e];
+    const bool use_s1_blocked = D == S1_PACK_D && H == S1_PACK_H;
+    const int8_t* s1_gate_e = shared ? g_s1_shared_gate : g_s1_gate[e];
+    const int8_t* s1_up_e = shared ? g_s1_shared_up : g_s1_up[e];
+    const int8_t* s1_down_e = shared ? g_s1_shared_down : g_s1_down[e];
 
-    if (use_small_gate_up) {
+    if (use_s1_blocked) {
+        s1_blocked_gate_up(
+            xq, s1_gate_e, s1_up_e, sum_gate_e, sum_up_e,
+            scratch.gate_out, scratch.up_out, D, H);
+    } else if (use_small_gate_up) {
         small_m_gate_up_output_major(
             xq, w_gate_e, w_up_e,
             sum_gate_e, sum_up_e,
@@ -1561,7 +1727,11 @@ static inline void s1_exec_task(
     const float hidden_scale = quantize_hidden_row(
         scratch.gated_fp32, scratch.quantized_gated, H, max_abs);
 
-    if (use_small_down) {
+    if (use_s1_blocked) {
+        s1_blocked_matmul(
+            scratch.quantized_gated, s1_down_e, sum_down_e,
+            scratch.down_out, H, D);
+    } else if (use_small_down) {
         small_m_matmul_output_major(
             scratch.quantized_gated, w_down_e, sum_down_e,
             scratch.down_out, 1, H, D);
