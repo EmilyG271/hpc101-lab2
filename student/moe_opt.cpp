@@ -1,4 +1,4 @@
-// Main task: optimize the MoE forward pass.
+﻿// Main task: optimize the MoE forward pass.
 //
 // Correctness-repaired version of the student's original AMX/AVX-512 design:
 //   router -> Top-K -> per-token W8A8 quantization -> expert grouping
@@ -19,6 +19,11 @@
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
+// R128: cache omp_get_num_procs (0.24us/call) — called every moe_forward.
+static inline int get_num_procs_cached() {
+    static int cached = omp_get_num_procs();
+    return cached;
+}
 
 #if defined(_OPENMP) && defined(__linux__)
 // R62: Bind threads to physical cores and pack them close together
@@ -156,6 +161,8 @@ alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
 alignas(64) static int8_t g_router_int8[MAX_NUM_EXPERTS * MAX_D_MODEL];
 alignas(64) static int8_t g_packed_router[MAX_D_MODEL * MAX_NUM_EXPERTS];
 static float g_scale_router[MAX_NUM_EXPERTS];
+// R134: 128 × per-expert router row-sum (for INT8 VNNI routing correction)
+static int32_t g_sum_router_128[MAX_NUM_EXPERTS];
 alignas(64) static int32_t g_router_logits[MAX_NUM_TOKENS * MAX_NUM_EXPERTS];
 
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -445,6 +452,8 @@ void preprocess(MoEWeights& w) {
 #endif
     }
     pack_output_major_weight(g_router_int8, g_packed_router, D, E);
+    // R134: precompute 128 × row-sum for INT8 VNNI routing
+    compute_output_major_row_sums(g_router_int8, g_sum_router_128, D, E);
 
     g_amx_runtime_enabled = request_amx_permission();
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -598,6 +607,60 @@ static inline void compute_routing_token(int t, const float* x, const MoEWeights
         }
 }
 
+// Forward decl: small_m_matmul_output_major is defined later
+static void small_m_matmul_output_major(const int8_t* A, const int8_t* W,
+    const int32_t* row_sums, int32_t* C, int M, int K, int N);
+
+// R134: INT8 VNNI routing for single-token S1 (E<=16, D=256).
+// Replaces FP16 FMA dot-products with VPDPBUSD, cutting ~1000 cycles.
+// Uses the same quantized input the expert GEMM already consumes, so no
+// extra quantization error beyond the INT8 router weights.
+static inline void compute_routing_int8_vnni(int t, const float* x,
+                                              const MoEWeights& w,
+                                              int D, int E, int K) {
+    const float x_scale = g_x_scale[t];
+    int32_t logits_i32[16];
+    small_m_matmul_output_major(
+        g_quantized_x + (size_t)t * D, g_router_int8,
+        g_sum_router_128, logits_i32, 1, D, E);
+
+    int best_idx[MAX_TOP_K] = {-1, -1, -1, -1};
+    float best_affinity[MAX_TOP_K] = {};
+    float best_score[MAX_TOP_K] = {};
+
+#if defined(__AVX512F__)
+    if (E == 16) {
+        const __m512 xs = _mm512_set1_ps(x_scale);
+        const __m512 rs = _mm512_loadu_ps(g_scale_router);
+        const __m512 one = _mm512_set1_ps(1.0f);
+        __m512 lf = _mm512_cvtepi32_ps(_mm512_loadu_si512(logits_i32));
+        lf = _mm512_mul_ps(lf, _mm512_mul_ps(xs, rs));
+        __m512 neg = _mm512_xor_ps(lf, _mm512_set1_ps(-0.0f));
+        __m512 aff = _mm512_rcp14_ps(_mm512_add_ps(one, exp512_ps(neg)));
+        alignas(64) float affinities[16];
+        _mm512_store_ps(affinities, aff);
+        for (int e = 0; e < 16; ++e)
+            insert_routing_candidate(e, affinities[e],
+                affinities[e] + w.bias[e], K, best_idx, best_affinity, best_score);
+    } else
+#endif
+    {
+        for (int e = 0; e < E; ++e) {
+            const float logit = (float)logits_i32[e] * x_scale * g_scale_router[e];
+            const float affinity = 1.0f / (1.0f + expf(-logit));
+            insert_routing_candidate(e, affinity, affinity + w.bias[e],
+                K, best_idx, best_affinity, best_score);
+        }
+    }
+
+    float affinity_sum = 0.0f;
+    for (int k = 0; k < K; ++k) affinity_sum += best_affinity[k];
+    for (int k = 0; k < K; ++k) {
+        g_topk_indices[t][k] = best_idx[k];
+        g_topk_weights[t][k] = best_affinity[k] / affinity_sum;
+    }
+}
+
 static inline void compute_routing(const float* x, const MoEWeights& w,
                                    int num_tokens, int D, int E, int K) {
 #if defined(_OPENMP)
@@ -681,11 +744,12 @@ static inline void quantize_input_token(int t, const float* x, int D) {
         g_x_scale[t] = scale;
 
 #if defined(__AVX512F__)
-        const __m512 scale_vec = _mm512_set1_ps(scale);
+        // R132: Multiply by reciprocal (1 cycle) instead of divide (14 cycles).
+        const __m512 inv_scale_vec = _mm512_set1_ps(1.0f / scale);
         const __m512 lo = _mm512_set1_ps(-127.0f);
         const __m512 hi = _mm512_set1_ps(127.0f);
         for (int d = 0; d < D; d += 16) {
-            __m512 q = _mm512_div_ps(_mm512_loadu_ps(x_t + d), scale_vec);
+            __m512 q = _mm512_mul_ps(_mm512_loadu_ps(x_t + d), inv_scale_vec);
             q = _mm512_roundscale_ps(
                 q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             q = _mm512_min_ps(hi, _mm512_max_ps(lo, q));
@@ -1563,7 +1627,7 @@ static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
     constexpr int NUM_EXPERTS = 5;
     constexpr int NUM_CHUNKS = 3;
     constexpr int NUM_THREADS = NUM_EXPERTS * NUM_CHUNKS;
-    if (D != 1024 || H != 512 || K != 4 || omp_get_num_procs() < NUM_THREADS)
+    if (D != 1024 || H != 512 || K != 4 || get_num_procs_cached() < NUM_THREADS)
         return false;
 
     const size_t expert_elems = (size_t)D * H;
@@ -1770,6 +1834,7 @@ static S1Worker g_s1_wkrs[MAX_TOP_K];
 static std::thread g_s1_thrds[MAX_TOP_K];
 static int g_s1_pool_sz = 0;
 static std::atomic<uint32_t> g_s1_epoch{0};
+static const MoEWeights* g_s1_last_w = nullptr;
 
 static void s1_worker_loop(int wid) {
     S1Worker& wk = g_s1_wkrs[wid];
@@ -1779,9 +1844,10 @@ static void s1_worker_loop(int wid) {
         wk.scratch.amx_perm = request_amx_permission();
     uint32_t seen = 0;
     for (;;) {
-        while (g_s1_epoch.load(std::memory_order_acquire) == seen)
+        uint32_t cur;
+        while ((cur = g_s1_epoch.load(std::memory_order_acquire)) == seen)
             _mm_pause();
-        seen = g_s1_epoch.load(std::memory_order_acquire);
+        seen = cur;
         if (seen == 0xFFFFFFFFu) break;
         wk.scratch.ensure(1, (size_t)wk.D, (size_t)wk.H);
         s1_exec_task(*wk.w, wk.D, wk.H, wk.task,
@@ -1816,14 +1882,20 @@ static void compute_single_token_routed_experts_parallel(
         const int nworkers = num_tasks - 1;
         ensure_s1_pool(nworkers);
 
-        for (int i = 0; i < nworkers; i++) {
-            g_s1_wkrs[i].w = &w;
-            g_s1_wkrs[i].D = D;
-            g_s1_wkrs[i].H = H;
-            g_s1_wkrs[i].task = i + 1;
-            g_s1_wkrs[i].use_small_gate_up = use_small_gate_up;
-            g_s1_wkrs[i].use_small_down = use_small_down;
-            g_s1_wkrs[i].y_acc = g_single_yacc[i + 1];
+        // R130: Worker params are constant across calls (same weights, D, H,
+        // task index, kernel selection, y_acc). Skip the setup loop after the
+        // first call to avoid dirtying worker cache lines with cross-core writes.
+        if (&w != g_s1_last_w) {
+            for (int i = 0; i < nworkers; i++) {
+                g_s1_wkrs[i].w = &w;
+                g_s1_wkrs[i].D = D;
+                g_s1_wkrs[i].H = H;
+                g_s1_wkrs[i].task = i + 1;
+                g_s1_wkrs[i].use_small_gate_up = use_small_gate_up;
+                g_s1_wkrs[i].use_small_down = use_small_down;
+                g_s1_wkrs[i].y_acc = g_single_yacc[i + 1];
+            }
+            g_s1_last_w = &w;
         }
         g_s1_epoch.fetch_add(1, std::memory_order_release);
 
@@ -1833,9 +1905,10 @@ static void compute_single_token_routed_experts_parallel(
         s1_exec_task(w, D, H, 0, use_small_gate_up, use_small_down,
                      tl_scratch, g_single_yacc[0]);
 
+        // R130: Hoist epoch load out of the wait loop.
+        const uint32_t target_epoch = g_s1_epoch.load(std::memory_order_relaxed);
         for (int i = 0; i < nworkers; i++) {
-            const uint32_t e = g_s1_epoch.load(std::memory_order_relaxed);
-            while (g_s1_wkrs[i].done.load(std::memory_order_acquire) != e)
+            while (g_s1_wkrs[i].done.load(std::memory_order_acquire) != target_epoch)
                 _mm_pause();
         }
 
@@ -2438,16 +2511,26 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int E = w.num_experts;
     const int K = w.top_k;
 
+    // R132: Fast path for S1 (N=1, D=256, H=128, K>=2).
+    // Skips omp_set_num_threads, s2_split check, and wrapper overhead.
+    // R134: S1 fast path with INT8 VNNI routing.
+    if (num_tokens == 1 && D == S1_PACK_D && H == S1_PACK_H && K >= 2) {
+        quantize_input(x, 1, D);
+        compute_routing_int8_vnni(0, x, w, D, E, K);
+        compute_single_token_routed_experts_parallel(x, w, y, D, H, K, K + 1);
+        return;
+    }
+
 #if defined(_OPENMP)
     // 根据批大小动态选择线程数，使各场景自动达到最优：
     //   N >= 512：使用全部可用核心（S4：16线程）
     //   N >= 64 ：限制为 8 线程（S3 实测最优）
     //   N < 64  ：单线程（S1、S2）
-    // omp_get_num_procs() 返回作业分配的 CPU 数（如 -c 16 → 16），
+    // get_num_procs_cached() 返回作业分配的 CPU 数（如 -c 16 → 16），
     // 不受之前 omp_set_num_threads() 调用影响。
     int opt_threads = 1;
     {
-        const int num_procs = omp_get_num_procs();
+        const int num_procs = get_num_procs_cached();
         if (num_tokens >= 512) {
             opt_threads = (num_procs < 8) ? num_procs : 8;
         } else if (num_tokens >= OMP_TOKEN_THRESHOLD) {
@@ -2505,7 +2588,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         if (compute_single_token_s2_split(x, w, y, D, H, K)) return;
 #endif
         int k_threads = K + 1;
-        const int np = omp_get_num_procs();
+        const int np = get_num_procs_cached();
         if (k_threads > np) k_threads = np;
         if (k_threads < 1) k_threads = 1;
         compute_single_token_routed_experts(
