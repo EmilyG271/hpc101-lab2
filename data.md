@@ -2454,3 +2454,54 @@ S1 从 50.5 下降到 48.1 (-2.4)，但被 S2 增益完全抵消。
 | S4 | 1.461s/1000 | 1.440s/1000 | 157x | ??(????) |
 - S2-S4 ??????, ???????. ?????: S1~100, S2~45, S3~90-104, S4=120, ??~91.
 - ??: R134 ?????, ???? S2-S4 ??.
+
+## R137 Baseline (hpc submit, dedicated 16 cores)
+| Scenario | Time | Speedup | Score |
+|---|---|---|---|
+| S1 | 0.02762s/10k | 18.3x | 102 |
+| S2 | 0.13248s/3k | 14.0x | 36 |
+| S3 | 0.08944s/1k | 74.0x | 104 |
+| S4 | 1.8755s/1k | 122.5x | 120 (cap) |
+| **Avg** | | | **90.4** |
+
+## R138: Incremental reduce (REVERTED)
+- Hypothesis: overlap 338-cyc reduce with 1372-cyc worker wait
+- Result: 17% SLOWER in direct execution (extra memory ops outweigh overlap)
+- Decision: REVERTED
+
+## R139: One-pass quantization for S1 (KEPT, pushed to GitHub 8eca4f2)
+- Hypothesis: Buffer x in ZMM registers during max-abs scan, eliminate 2nd pass over x.
+  x gets evicted from L1 by weight streaming; 2nd pass reloads from L3 (expensive).
+- Result (hpc submit, interleaved 3x each):
+  - R139 S1 min: 0.02416s/10k = 2.416us -> 21.0x (score ~117)
+  - R137 S1 min: 0.02872s/10k = 2.872us -> 17.6x (score ~98)
+  - Improvement: +16% S1, +15 score points
+- Correctness: RMSE 0.000322417 (identical to R137)
+- S2-S4: unaffected (only S1 fast path changed, code path identical)
+
+## R139 Estimated Scores
+| Scenario | Speedup | Score |
+|---|---|---|
+| S1 | 21.0x | 117 |
+| S2 | 14.0x | 36 |
+| S3 | 74.0x | 104 |
+| S4 | 122.5x | 120 (cap) |
+| **Avg** | | **94.3** |
+
+## Optimization History Summary
+- R126: Blocked VNNI 16-output layout (+17.68% S1, biggest historical win)
+- R134: INT8 VNNI routing (+16% S1)
+- R137: Single-ZMM VNNI routing (neutral, cleaner)
+- R139: One-pass quantization (+16% S1) -- CURRENT BEST
+
+## Failed Directions (do not retry)
+- R138: Incremental reduce (extra memory ops)
+- R112: SwiGLU 8-ZMM register residency
+- R114: Full ZMM sigmoid
+- R120: Packed full-output Gate/Up
+- R123: Expert-internal multi-core split
+- R135: Per-expert 16-worker pool
+- Software prefetching (interferes with HW prefetcher)
+- S2 persistent thread pool (slower than libgomp barriers)
+- Increasing S3/S4 thread count (bandwidth/AMX limited)
+- Tree reduction (decreasing parallelism)
