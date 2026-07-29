@@ -2588,3 +2588,9 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - All four formal scenarios pass correctness; the changed code is inside the E >= 64 S4 Router branch.
 - Same-node S4 A/B: R175 2.67121 / 2.72070 / 2.71971 s; R176 2.65261 / 2.67977 / 2.64180 s. R176 wins every pair (about 1.7% median improvement).
 - Current best: R176 = R170 + R174 + R175 + vectorized refinement sigmoid.
+
+
+### R177: rcp14 for final vector refinement sigmoid [REVERTED]
+- Correctness passed but changed S4 RMSE from 0.00063549 to 0.00063563.
+- S4 A/B was not stable: R176 2.64662 / 2.71224 / 2.69104 s; R177 2.66998 / 2.65532 / 2.68720 s.
+- Decision: reverted. The small and inconsistent timing change does not justify reducing final sigmoid precision.
