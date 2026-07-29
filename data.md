@@ -2581,3 +2581,10 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - Kept: R174 and R175, both reduce the S4 Router critical path.
 - Reverted: R171 (S2 guard instability), R172 (no stable S4 gain), R173 (routing correctness failure).
 - S4 direction: after R169, Router remains the productive optimization target; keep N_CAND=4 and improve its AMX/FP16 execution rather than shrinking it further.
+
+
+### R176: vectorize four FP16 refinement sigmoids [SUCCESS]
+- R175 still evaluated the four refined Router sigmoids with scalar libm expf. Evaluate the four logits together using exp512_ps and vector division.
+- All four formal scenarios pass correctness; the changed code is inside the E >= 64 S4 Router branch.
+- Same-node S4 A/B: R175 2.67121 / 2.72070 / 2.71971 s; R176 2.65261 / 2.67977 / 2.64180 s. R176 wins every pair (about 1.7% median improvement).
+- Current best: R176 = R170 + R174 + R175 + vectorized refinement sigmoid.

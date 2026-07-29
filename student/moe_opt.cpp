@@ -2549,9 +2549,18 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
             const float logits[4] = {_mm512_reduce_add_ps(a0),
                 _mm512_reduce_add_ps(a1), _mm512_reduce_add_ps(a2),
                 _mm512_reduce_add_ps(a3)};
+            // R176 candidate: evaluate the four refinement sigmoids as one
+            // AVX-512 vector instead of four scalar libm expf calls.
+            const __m512 lv = _mm512_castps128_ps512(_mm_loadu_ps(logits));
+            const __m512 one = _mm512_set1_ps(1.0f);
+            const __m512 neg = _mm512_xor_ps(lv, _mm512_set1_ps(-0.0f));
+            const __m512 affinity_v = _mm512_div_ps(one,
+                _mm512_add_ps(one, exp512_ps(neg)));
+            alignas(64) float affinities[16];
+            _mm512_store_ps(affinities, affinity_v);
             for (int j = 0; j < 4; ++j) {
                 const int e = experts[j];
-                const float affinity = 1.0f / (1.0f + expf(-logits[j]));
+                const float affinity = affinities[j];
                 insert_routing_candidate(e, affinity, affinity + w.bias[e], K,
                                         best_idx, best_affinity, best_score);
             }
