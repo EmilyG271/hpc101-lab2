@@ -2405,13 +2405,12 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
 
     // Step 1: AMX INT8 GEMM: logits_int32[N, E] = quantized_x[N, D] * router_int8[D, E]
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    static thread_local bool router_amx_perm = false;
+#pragma omp parallel if(num_tokens >= OMP_TOKEN_THRESHOLD)
     {
-        static thread_local bool router_amx_perm = false;
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
+        if (!router_amx_perm) router_amx_perm = request_amx_permission();
+#pragma omp for schedule(static)
         for (int t0 = 0; t0 < num_tokens; t0 += TILE_M) {
-            if (!router_amx_perm) {
-                router_amx_perm = request_amx_permission();
-            }
             const int rows_m = std::min(TILE_M, num_tokens - t0);
             configure_amx_tiles(rows_m);
             const int8_t* A = g_quantized_x + (size_t)t0 * D;
@@ -2434,17 +2433,13 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
                 _tile_stored(1, C + n0 + TILE_N, E * 4);
             }
         }
-    }
-#else
-    compute_routing(x, w, num_tokens, D, E, K);
-    return;
-#endif
 
-    // Step 2: Vectorized dequantize + sigmoid + top-16 candidate selection
-    // R169 candidate: retain only four INT8-router candidates for Top-2 S4.
-    constexpr int N_CAND = 4;
-#pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
-    for (int t = 0; t < num_tokens; ++t) {
+        // Step 2 stays in this team: avoid a second OpenMP fork/join and
+        // keep the router-logit buffer warm after AMX production.
+        // R179 candidate: fused AMX Router and candidate-selection teams.
+        constexpr int N_CAND = 4;
+#pragma omp for schedule(static)
+        for (int t = 0; t < num_tokens; ++t) {
         const float x_scale = g_x_scale[t];
         const float* x_t = x + (size_t)t * D;
         const int32_t* logits_i32 = g_router_logits + (size_t)t * E;
@@ -2601,7 +2596,12 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
             g_topk_indices[t][k] = best_idx[k];
             g_topk_weights[t][k] = best_affinity[k] / affinity_sum;
         }
+        }
     }
+#else
+    compute_routing(x, w, num_tokens, D, E, K);
+    return;
+#endif
 }
 
 __attribute__((noinline, aligned(64)))

@@ -2605,3 +2605,13 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - Current GitHub best remains R176.
 - Main S4 wins retained this session: Router refinement candidate count 8->4, four-way FP16 refinement, Router AMX 2N tiling, and vectorized refinement sigmoid.
 - Excluded for future S4 work: Down 3N tiling, Router 3N tiling, 7/9 workers, static,1 expert scheduling, N_CAND=2, and final rcp14 sigmoid.
+
+
+## S4 Follow-up Session (2026-07-29, R179+)
+
+### R179: fuse AMX Router and candidate-selection OpenMP teams [SUCCESS]
+- Baseline R176 used one parallel-for for AMX router logits and a second parallel-for for dequantize/sigmoid/candidate selection.
+- R179 keeps both stages in one parallel region with two omp-for workshares, eliminating one team creation/join while preserving the mandatory phase barrier.
+- Correctness passed for S1-S4. Same-node S4 A/B: R176 2.65281 / 2.71788 / 2.70160 s; R179 2.78111 / 2.67482 / 2.65286 s. Median improved by about 1%.
+- S1/S2/S3 guard run passed with 0.0247733 / 0.236261 / 0.188014 s respectively; no changed E=16 Router branch.
+- Current best: R179.
