@@ -2416,14 +2416,22 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
             configure_amx_tiles(rows_m);
             const int8_t* A = g_quantized_x + (size_t)t0 * D;
             int32_t* C = g_router_logits + (size_t)t0 * E;
-            for (int n0 = 0; n0 < E; n0 += TILE_N) {
+            // R175 candidate: router E=512 is also a wide AMX GEMM.
+            // Reuse each A tile for two adjacent 16-expert output tiles.
+            for (int n0 = 0; n0 < E; n0 += 2 * TILE_N) {
                 _tile_zero(0);
+                _tile_zero(1);
                 for (int k0 = 0; k0 < D; k0 += TILE_K) {
                     _tile_loadd(2, A + k0, D);
-                    _tile_loadd(3, g_packed_router + (size_t)(k0 / 4) * (E * 4) + n0 * 4, E * 4);
+                    const int8_t* b = g_packed_router +
+                        (size_t)(k0 / 4) * (E * 4) + n0 * 4;
+                    _tile_loadd(3, b, E * 4);
+                    _tile_loadd(4, b + TILE_N * 4, E * 4);
                     _tile_dpbssd(0, 2, 3);
+                    _tile_dpbssd(1, 2, 4);
                 }
                 _tile_stored(0, C + n0, E * 4);
+                _tile_stored(1, C + n0 + TILE_N, E * 4);
             }
         }
     }
@@ -2506,7 +2514,49 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
         float best_score[MAX_TOP_K] = {};
 
 #if defined(__AVX512F__)
-        for (int c = 0; c < N_CAND; ++c) {
+        // R174 candidate: N_CAND=4 lets FP16 refinement reuse each x ZMM
+        // across four candidate rows and exposes four independent FMA chains.
+        int c = 0;
+        for (; c + 3 < N_CAND && cand_idx[c + 3] >= 0; c += 4) {
+            const int e0 = cand_idx[c + 0];
+            const int e1 = cand_idx[c + 1];
+            const int e2 = cand_idx[c + 2];
+            const int e3 = cand_idx[c + 3];
+            const __m256i* r0 = reinterpret_cast<const __m256i*>(
+                g_router_f16 + (size_t)e0 * D);
+            const __m256i* r1 = reinterpret_cast<const __m256i*>(
+                g_router_f16 + (size_t)e1 * D);
+            const __m256i* r2 = reinterpret_cast<const __m256i*>(
+                g_router_f16 + (size_t)e2 * D);
+            const __m256i* r3 = reinterpret_cast<const __m256i*>(
+                g_router_f16 + (size_t)e3 * D);
+            __m512 a0 = _mm512_setzero_ps();
+            __m512 a1 = _mm512_setzero_ps();
+            __m512 a2 = _mm512_setzero_ps();
+            __m512 a3 = _mm512_setzero_ps();
+            for (int d = 0; d < D; d += 16) {
+                const __m512 xv = _mm512_loadu_ps(x_t + d);
+                a0 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(
+                    _mm256_loadu_si256(r0 + d / 16)), a0);
+                a1 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(
+                    _mm256_loadu_si256(r1 + d / 16)), a1);
+                a2 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(
+                    _mm256_loadu_si256(r2 + d / 16)), a2);
+                a3 = _mm512_fmadd_ps(xv, _mm512_cvtph_ps(
+                    _mm256_loadu_si256(r3 + d / 16)), a3);
+            }
+            const int experts[4] = {e0, e1, e2, e3};
+            const float logits[4] = {_mm512_reduce_add_ps(a0),
+                _mm512_reduce_add_ps(a1), _mm512_reduce_add_ps(a2),
+                _mm512_reduce_add_ps(a3)};
+            for (int j = 0; j < 4; ++j) {
+                const int e = experts[j];
+                const float affinity = 1.0f / (1.0f + expf(-logits[j]));
+                insert_routing_candidate(e, affinity, affinity + w.bias[e], K,
+                                        best_idx, best_affinity, best_score);
+            }
+        }
+        for (; c < N_CAND; ++c) {
             if (cand_idx[c] < 0) break;
             const int e = cand_idx[c];
             const __m256i* r_e = reinterpret_cast<const __m256i*>(

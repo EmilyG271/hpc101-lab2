@@ -2552,3 +2552,32 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - Failures: AMX 3N Down tiling, 7/9 S4 workers, and LPT static,1 scheduling.
 - Current best: R170 (R169 Router reduction plus forward-entry alignment guard).
 - Next: investigate S4 Router logits traffic and routed-expert y_acc reduction without changing S1-S3 paths.
+
+
+### R171: Router refinement candidates 4 -> 3 [REVERTED]
+- S4 correctness passed for the fixed verification batch and S4 A/B was faster than R170.
+- The E=16 S2 guard showed unstable regressions across both A/B orders, so it was rejected under the no-regression rule.
+
+### R172: rcp14 in coarse AMX Router sigmoid [REVERTED]
+- Replaced the S4 vector coarse-sigmoid division with rcp14.
+- Same-node S4 A/B was not stable: 2.71332 / 2.88502 / 3.33437 s versus R170 2.73384 / 2.73165 / 3.46213 s.
+- Decision: reverted; reciprocal approximation does not improve this mixed AMX/selection path.
+
+### R173: Router refinement candidates 4 -> 2 [FAILED CORRECTNESS]
+- S4 verification failed: 23 / 1024 tokens exceeded tolerance; relative RMSE 0.12917.
+- Conclusion: four coarse candidates are needed for correct Top-2 refinement on this workload.
+
+### R174: four-way FP16 candidate refinement [SUCCESS]
+- With N_CAND=4, compute the four FP16 Router dot products together: reuse each x ZMM and keep four FMA chains live.
+- Same-node S4 A/B: R170 2.77435 / 2.77684 / 2.75492 s; R174 2.71926 / 2.72512 / 2.73240 s (about 1.8% faster).
+
+### R175: AMX Router 2N tiling [SUCCESS]
+- The E=512 Router AMX GEMM previously processed one 16-expert N tile at a time. Reuse each A tile for two adjacent N tiles, analogous to retained R111 Down 2N tiling.
+- Correctness passed with unchanged S4 RMSE.
+- R174 vs R175 same-node S4 A/B: R174 3.29672 / 3.11859 / 2.89613 s; R175 3.01868 / 2.95054 / 2.71439 s. R175 wins every pair.
+- Current best: R175 = R170 + four-way FP16 candidate refinement + Router AMX 2N tiling.
+
+### Five-round report (R171-R175)
+- Kept: R174 and R175, both reduce the S4 Router critical path.
+- Reverted: R171 (S2 guard instability), R172 (no stable S4 gain), R173 (routing correctness failure).
+- S4 direction: after R169, Router remains the productive optimization target; keep N_CAND=4 and improve its AMX/FP16 execution rather than shrinking it further.
