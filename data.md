@@ -2505,3 +2505,50 @@ S1 从 50.5 下降到 48.1 (-2.4)，但被 S2 增益完全抵消。
 - S2 persistent thread pool (slower than libgomp barriers)
 - Increasing S3/S4 thread count (bandwidth/AMX limited)
 - Tree reduction (decreasing parallelism)
+
+
+## S4 Optimization Session (2026-07-29, R165-R170)
+
+### R139 Baseline (16 threads, --benchmark)
+| Scenario | Run | Time |
+|---|---:|---:|
+| S1 | 10000 iter | 0.023608 s |
+| S2 | 3000 iter | 0.104209 s |
+| S3 | 1000 iter | 0.090017 s |
+| S4 | 1000 iter | 1.45224 s |
+
+S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expert-weight streaming and backend supply.
+
+### R165: AMX Down projection 2N -> 3N tiling [FAILED, reverted]
+- Hypothesis: add a third C/B tile pair so N=512 Down reuses each A tile across 48 outputs.
+- Correctness passed. S4 runs: 1.53253 / 1.44813 / 1.47593 s.
+- Decision: reverted. The saved A loads did not offset extra B/C tile pressure.
+
+### R166: S4 worker count 8 -> 7 [FAILED, reverted]
+- S4 runs: 1.58242 / 1.53656 / 1.53010 s.
+- Decision: reverted. Seven workers expose memory latency.
+
+### R167: S4 worker count 8 -> 9 [FAILED, reverted]
+- S4 runs: 1.62061 / 1.63861 / 1.61115 s.
+- Decision: reverted. More workers increase bandwidth/cache contention.
+
+### R168: LPT plus static,1 expert scheduling [FAILED, reverted]
+- S4 runs: 1.49716 / 1.46689 / 1.45705 s.
+- Decision: reverted. Dynamic scheduling is more robust to random expert-token load.
+
+### R169: S4 Router FP16 refinement candidates 8 -> 4 [SUCCESS]
+- Applies only to the E >= 64 INT8-AMX Router path; S1-S3 keep E=16 path.
+- Correctness passed for all formal scenarios; S4 RMSE remains 0.00063549.
+- Independent S4 runs: 1.27453 / 1.25345 / 1.31721 s, about 12% faster than R139.
+- Same-node interleaved S4 A/B: R139 3.07204 / 3.09934 / 3.08067 s; R169 2.72705 / 2.81137 / 2.73791 s, about 11% faster.
+
+### R170: Align top-level forward to 64 bytes [KEPT with R169]
+- `moe_forward_optimized` is noinline and 64-byte aligned to protect S1 from instruction-layout variance.
+- Same-node S1 median: R170 0.0245369 s vs R139 0.0244207 s (less than 1% difference).
+- Warm S2 A/B is neutral (R139 0.240697 s vs R170 0.240694 s); S3 has no stable regression.
+
+### Five-round report (R165-R169)
+- Success: R169 halves FP16 Router refinement work for S4 and improves S4 by about 11-12%.
+- Failures: AMX 3N Down tiling, 7/9 S4 workers, and LPT static,1 scheduling.
+- Current best: R170 (R169 Router reduction plus forward-entry alignment guard).
+- Next: investigate S4 Router logits traffic and routed-expert y_acc reduction without changing S1-S3 paths.

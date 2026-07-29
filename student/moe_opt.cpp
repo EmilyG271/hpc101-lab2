@@ -2433,7 +2433,8 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
 #endif
 
     // Step 2: Vectorized dequantize + sigmoid + top-16 candidate selection
-    constexpr int N_CAND = 8;
+    // R169 candidate: retain only four INT8-router candidates for Top-2 S4.
+    constexpr int N_CAND = 4;
 #pragma omp parallel for schedule(static) if(num_tokens >= OMP_TOKEN_THRESHOLD)
     for (int t = 0; t < num_tokens; ++t) {
         const float x_scale = g_x_scale[t];
@@ -2544,6 +2545,7 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
     }
 }
 
+__attribute__((noinline, aligned(64)))
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
     const int D = w.d_model;
