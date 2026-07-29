@@ -2594,3 +2594,14 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - Correctness passed but changed S4 RMSE from 0.00063549 to 0.00063563.
 - S4 A/B was not stable: R176 2.64662 / 2.71224 / 2.69104 s; R177 2.66998 / 2.65532 / 2.68720 s.
 - Decision: reverted. The small and inconsistent timing change does not justify reducing final sigmoid precision.
+
+
+### R178: Router AMX 3N tiling [REVERTED]
+- Router E=512/K=512 was tested with three C/B tiles so each A tile feeds 48 experts; 2N was retained for the final 32-expert tail.
+- Correctness passed, but S4 A/B was not stable: R176 2.65720 / 2.72771 / 3.30245 s; R178 2.77825 / 3.32763 / 2.73598 s.
+- Decision: reverted. The additional live tile state and B loads are worse than the retained Router 2N design.
+
+### End-of-session status
+- Current GitHub best remains R176.
+- Main S4 wins retained this session: Router refinement candidate count 8->4, four-way FP16 refinement, Router AMX 2N tiling, and vectorized refinement sigmoid.
+- Excluded for future S4 work: Down 3N tiling, Router 3N tiling, 7/9 workers, static,1 expert scheduling, N_CAND=2, and final rcp14 sigmoid.
