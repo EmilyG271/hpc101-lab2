@@ -2645,3 +2645,14 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - No new version retained; R179 remains current best.
 - Confirmed exclusions: cyclic nowait Router workshares, fused quantize/Router as implemented, dynamic chunk=2, final reduction barrier micro-tuning, and incomplete Router-only thread expansion.
 - Next direction: improve router candidate selection arithmetic or redesign y_acc ownership only with a full correctness-preserving dataflow proof.
+
+
+### R185: Router-only all-worker expansion [FAILED, reverted]
+- Kept the existing quantization pass, but temporarily raised only the S4 AMX Router team from 8 to all workers before restoring 8 for experts.
+- Correctness passed but performance collapsed: 100 S4 iterations took 11.6033 s, indicating severe oversubscription/worker-pool contention in this environment.
+- Decision: immediately reverted. Do not expand Router worker count through omp_set_num_threads without controlling the runtime team topology.
+
+### Five-round report (R181-R185)
+- No version retained after R179.
+- Failed directions: quantize/Router fusion as implemented, dynamic chunk=2, final reduction barrier micro-tuning, incomplete Router-only worker expansion, and cyclic no-barrier workshares.
+- Current best remains R179. The remaining profile is still backend-bound; future work should focus on a proven dataflow change rather than OpenMP micro-tuning.
