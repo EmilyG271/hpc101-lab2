@@ -2615,3 +2615,33 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - Correctness passed for S1-S4. Same-node S4 A/B: R176 2.65281 / 2.71788 / 2.70160 s; R179 2.78111 / 2.67482 / 2.65286 s. Median improved by about 1%.
 - S1/S2/S3 guard run passed with 0.0247733 / 0.236261 / 0.188014 s respectively; no changed E=16 Router branch.
 - Current best: R179.
+
+
+### R180: matched static workshares with no Router barrier [FAILED, reverted]
+- Used cyclic 16-token ownership to remove the AMX-router to candidate-selection barrier.
+- S4 A/B: R179 2.69378 / 2.71577 / 2.72329 s; R180 2.78044 / 2.71240 / 2.95338 s.
+- Decision: reverted. Cyclic AMX tile ownership hurts locality more than one barrier costs.
+
+### R181: fuse quantization into Router AMX tiles [FAILED, reverted]
+- Intended to remove the standalone quantization team by quantizing each 16-token Router tile before AMX.
+- S4 A/B was not stable: R179 2.74493 / 2.91321 / 2.71091 s; R181 2.95186 / 2.64495 / 2.70656 s.
+- Decision: reverted; no repeatable gain.
+
+### R182: S4 dynamic expert chunk 1 -> 2 [FAILED, reverted]
+- S4 A/B: R179 2.64307 / 2.65711 / 2.69505 s; R182 2.68323 / 2.71866 / 2.73005 s.
+- Decision: reverted. Chunk=1 remains necessary for LPT balance.
+
+### R183: remove final y_acc reduction barrier [NEUTRAL, reverted]
+- Saved only the final redundant OpenMP barrier in the large-ystride sequential reduction.
+- S4 A/B: R179 2.65777 / 2.71481 / 2.70795 s; R183 2.65396 / 2.69090 / 2.71316 s.
+- Decision: reverted; gain is below noise.
+
+### R184: Router-only 16-worker experiment [FAILED CORRECTNESS, reverted]
+- Attempted to temporarily use all workers for Router AMX while restoring 8 for experts.
+- The first incomplete quantization-fusion variant omitted Router input quantization; S4 failed 1024/1024 tokens (relative RMSE 0.999978).
+- Decision: immediately reverted. Do not revisit without a complete fused quantization implementation and separate correctness design.
+
+### Five-round report (R180-R184)
+- No new version retained; R179 remains current best.
+- Confirmed exclusions: cyclic nowait Router workshares, fused quantize/Router as implemented, dynamic chunk=2, final reduction barrier micro-tuning, and incomplete Router-only thread expansion.
+- Next direction: improve router candidate selection arithmetic or redesign y_acc ownership only with a full correctness-preserving dataflow proof.
