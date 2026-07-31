@@ -2656,3 +2656,30 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - No version retained after R179.
 - Failed directions: quantize/Router fusion as implemented, dynamic chunk=2, final reduction barrier micro-tuning, incomplete Router-only worker expansion, and cyclic no-barrier workshares.
 - Current best remains R179. The remaining profile is still backend-bound; future work should focus on a proven dataflow change rather than OpenMP micro-tuning.
+
+
+## S4 Follow-up Session 2 (2026-07-31, R186-R190)
+
+### R186: index-wise y_acc reduction [FAILED, reverted]
+- Replaced the S4 sequential per-thread reduction with one pass summing all thread slices per output index.
+- All samples were substantially slower: R179 2.59062 / 2.69453 / 2.63360 s; R186 3.14561 / 3.14130 / 3.14170 s.
+
+### R187: lazy initialization for large S4 y_acc [FAILED, reverted]
+- Re-enabled lazy initialization for the 2MB-per-thread S4 accumulation slices.
+- R179/R187: 2.70706 / 3.00716 / 2.72060 s vs 3.18494 / 3.19128 / 3.08447 s. Full memset remains better.
+
+### R188: dynamic expert chunk=4 [FAILED, reverted]
+- R179/R188: 2.70693 / 2.71126 / 2.72963 s vs 2.74900 / 2.80402 / 2.73951 s.
+- Chunk=1 remains the best dynamic scheduling choice.
+
+### R189: guided expert scheduling [FAILED, reverted]
+- Guided scheduling caused a smoke-test regression to 0.441189 s per 100 iterations; reverted without formal A/B.
+
+### R190: dynamic expert chunk=8 [FAILED, reverted]
+- R179/R190: 2.67308 / 2.68859 / 2.64912 s vs 2.73861 / 2.76454 / 2.80142 s.
+- Larger chunks worsen load balance and were reverted.
+
+### Five-round report (R186-R190)
+- No new version retained; R179 remains current best.
+- Confirmed the S4 reduction should remain sequential per-thread, y_acc should remain fully memset, and expert scheduling should remain dynamic chunk=1.
+- Future work should avoid repeating these memory/reduction/scheduling variants and target a larger dataflow or Router arithmetic change.
