@@ -2683,3 +2683,32 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - No new version retained; R179 remains current best.
 - Confirmed the S4 reduction should remain sequential per-thread, y_acc should remain fully memset, and expert scheduling should remain dynamic chunk=1.
 - Future work should avoid repeating these memory/reduction/scheduling variants and target a larger dataflow or Router arithmetic change.
+
+
+## S4 Follow-up Session 3 (2026-07-31, R186-R191)
+
+### R186: index-wise y_acc reduction [FAILED]
+- S4 reduction changed from sequential per-thread passes to one pass summing all slices per output index.
+- R179: 2.59062 / 2.69453 / 2.63360 s; R186: 3.14561 / 3.14130 / 3.14170 s. Reverted.
+
+### R187: lazy initialization for large y_acc [FAILED]
+- R179/R187: 2.70706 / 3.00716 / 2.72060 s vs 3.18494 / 3.19128 / 3.08447 s. Full memset remains better. Reverted.
+
+### R188: dynamic expert chunk=4 [FAILED]
+- R179/R188: 2.70693 / 2.71126 / 2.72963 s vs 2.74900 / 2.80402 / 2.73951 s. Reverted.
+
+### R189: guided expert scheduling [FAILED]
+- Guided scheduling caused a smoke-test regression to 0.441189 s per 100 iterations. Reverted immediately.
+
+### R190: dynamic expert chunk=8 [FAILED]
+- R179/R190: 2.67308 / 2.68859 / 2.64912 s vs 2.73861 / 2.76454 / 2.80142 s. Reverted.
+
+### R191: complete tile-local quantization fusion [NEUTRAL, reverted]
+- Quantized each Router AMX tile immediately before its GEMM and removed the separate quantization team for E>=64.
+- Correctness passed. Reverse-order same-node A/B: R191 2.72143 / 2.70483 / 2.71440 s; R179 2.72467 / 2.70469 / 2.65733 s.
+- Decision: no stable benefit; R179 retained.
+
+### Five-round report (R186-R190)
+- No source version was retained; R179 remains current best.
+- The S4 full memset, sequential y_acc reduction, dynamic chunk=1 scheduling, and separate quantization path remain preferable.
+- R191 was also rejected as neutral after reverse-order A/B.
