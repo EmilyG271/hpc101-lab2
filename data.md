@@ -2797,3 +2797,12 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Hypothesis: the S3 shared-expert OpenMP outlined function starts at `0x8db0`, 48 bytes off a cache-line boundary. Add `aligned(64)` to `compute_shared_expert`.
 - Result: GCC did not propagate the parent attribute to the generated OpenMP outlined clone; its address remained `0x8db0`. Extracted `.text` sections of R197 and R198 were byte-identical.
 - Decision: no OJ run was needed because executable machine code was unchanged. Reverted the source-only attribute and retained R197.
+
+### R199: GCC local align-functions for shared-expert OpenMP clone [FAILED, reverted]
+
+- Hypothesis: R198 showed that a normal function attribute does not propagate to GCC's generated OpenMP clone. Wrap `compute_shared_expert` in `#pragma GCC optimize ("align-functions=64")` so the outlined clone itself is aligned.
+- Binary result: the clone moved from `0x8db0` to aligned address `0x8e00`; downstream functions shifted by 64 bytes.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R197 -> R199: S1 21.045 -> 20.329; S2 15.149 -> 15.566; S3 59.757 -> 59.984; S4 134.575 -> 133.843.
+- The intended S3 gain was only +0.38%, while S1 lost about 3.4%. Estimated total score was neutral to slightly lower despite S2 improving about 2.8%.
+- Decision: reverted. Directly aligning the shared-expert clone is not worth the downstream layout cost; R197 remains best.
