@@ -2839,3 +2839,12 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Current GitHub best: R201.
 - Current five-run median checkpoint estimate: S1 20.688x, S2 16.016x, S3 59.615x, S4 124.748x, average about 93.92 points.
 - Next plan: preserve the R197/R200 alignment gains, profile or inspect the S4 first-call path, and attempt an S4-local change placed after E=16 hot functions so S1-S3 layout remains stable.
+
+### R202: align S4 INT8-AMX Router OpenMP clone [FAILED, reverted]
+
+- Hypothesis: R201's S4 Router clone was at `0xa090`, 16 bytes off a cache-line boundary. Wrap only `compute_routing_int8_amx` in GCC `align-functions=64` pragmas while preserving the R200/R201 E=16 alignments.
+- Binary result: the S4 Router clone moved to aligned `0xa0c0`; E=16 Router and top-level clones also remained 64-byte aligned.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R201 -> R202: S1 20.968 -> 21.141; S2 15.602 -> 15.450; S3 58.756 -> 49.374; S4 127.401 -> 129.499.
+- S4 improved about 1.65%, but S3 was unstable and two candidate runs were slow (46.71x/49.37x). The extra padding shifts the large `compute_routing_token`/E=16 region even though those entry points remain aligned.
+- Decision: reverted because total score decreased. Direct S4 Router alignment cannot be retained unless the E=16 layout is independently stabilized.
