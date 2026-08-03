@@ -2791,3 +2791,9 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Relative changes: S1 +0.63%, S2 +5.91%, S3 +2.08%, S4 -0.39%. Using the 60/100/120 checkpoint interpolation, estimated average score improved by about 1.5 points (94.7 -> 96.3 on this allocation).
 - Diagnosis: the S2 VNNI Gate/Up helper is sufficiently front-end/layout sensitive that cache-line alignment gives a repeatable gain. The small S1/S3 gains likely come from favorable downstream layout; S4 is effectively neutral.
 - Decision: retained as the new current best R197 and pushed to GitHub.
+
+### R198: align shared-expert parent function [NEUTRAL, not retained]
+
+- Hypothesis: the S3 shared-expert OpenMP outlined function starts at `0x8db0`, 48 bytes off a cache-line boundary. Add `aligned(64)` to `compute_shared_expert`.
+- Result: GCC did not propagate the parent attribute to the generated OpenMP outlined clone; its address remained `0x8db0`. Extracted `.text` sections of R197 and R198 were byte-identical.
+- Decision: no OJ run was needed because executable machine code was unchanged. Reverted the source-only attribute and retained R197.
