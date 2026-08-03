@@ -2751,3 +2751,12 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - S4 median optimized time improved slightly from 17.8813 ms to 17.6855 ms, but S3 median regressed from 22.3429 ms to 27.7232 ms even though the new branch is not executed for E=16.
 - Diagnosis: adding a sizable inline block near the beginning of the translation unit shifted the addresses/alignment of later hot helper functions. `moe_forward_optimized` itself is 64-byte aligned, but the S3 router/expert helpers are not; the candidate showed a repeatable code-layout sensitivity in two of three S3 runs.
 - Decision: reverted because total score decreased. Next: keep the same S4-only prewarm idea but place its noinline implementation after all hot kernels, leaving only a small call in `preprocess()`.
+
+### R195: out-of-line large-E scratch prewarm [FAILED, reverted]
+
+- Hypothesis: R194's S3 regression came from inserting a large preprocess block before all hot kernels. Move the noinline prewarm body after `moe_forward_optimized`, leaving only a declaration and one call before weight packing.
+- Change: same 8-thread, 16-row scratch allocation and AMX-permission prewarm as R194, but the implementation was emitted after all existing hot functions to reduce code-layout disturbance.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R179 -> R195: S1 20.707 -> 21.789 (high variance); S2 15.704 -> 14.493; S3 56.811 -> 59.965; S4 132.001 -> 119.848.
+- S4 median optimized time regressed from 17.3284 ms to 19.0471 ms, and S2 also regressed materially. The prewarm's runtime state, not only code layout, is harmful: workers initialized before the long weight-packing phase later enter the timed call in an unfavorable sleep/cache/runtime state.
+- Decision: reverted. Large-E OpenMP/scratch prewarming is exhausted; keep lazy first-call initialization and move to affinity robustness.
