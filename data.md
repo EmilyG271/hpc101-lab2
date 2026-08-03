@@ -2817,3 +2817,25 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Relative changes: S1 +1.13%, S2 +1.17%, S3 +1.41%, S4 +0.10%. Estimated checkpoint-interpolated average improved by about 0.6 points on this allocation.
 - Diagnosis: aligning the E=16 Router outlined loop improves front-end fetch and also produces a favorable downstream layout without a measurable S4 penalty.
 - Decision: retained as new current best R200 and pushed to GitHub.
+
+### R201: align top-level OpenMP clone [SUCCESS by total score, kept]
+
+- Hypothesis: after R200, the `moe_forward_optimized` OpenMP clone used by S3's fused quantize+Router loop started at `0xc1d0`. Wrap the top-level function in GCC `align-functions=64` pragmas while retaining its explicit 64-byte entry alignment.
+- Binary result: the top-level OpenMP clone moved to aligned `0xc1c0`; the E=16 Router clone remained aligned at `0xc100`.
+- Correctness: S1-S4 all passed.
+- Initial three-run results suggested strongly improved S3 stability but high baseline variance, so a separate five-run confirmation was used for the decision.
+- Five-run median OJ speedups, R200 -> R201: S1 20.839 -> 20.688; S2 15.495 -> 16.016; S3 60.100 -> 59.615; S4 128.986 -> 124.748.
+- Relative changes: S1 -0.73%, S2 +3.36%, S3 -0.81%, S4 -3.29%.
+- With the user-provided 60/100/120 checkpoints and piecewise-linear interpolation, estimated average score improved slightly from 93.63 to 93.92 (+0.29), because S2 is above its 100-point checkpoint and has high score leverage.
+- Decision: retained under the explicit total-score rule, despite the S4 regression. R201 is the new current best; future rounds must try to recover S4 without losing the S2 gain.
+
+### Five-round report (R197-R201)
+
+- R197 S2 VNNI hot-function alignment: success and retained. Five-run medians improved S1 0.63%, S2 5.91%, S3 2.08%; S4 was neutral. Estimated gain about 1.5 points.
+- R198 normal shared-expert attribute: neutral; GCC generated identical `.text`, so no OJ run was needed.
+- R199 forced shared-expert OpenMP-clone alignment: failed; S2 improved but S1 regressed enough to reduce total score.
+- R200 forced E=16 Router OpenMP-clone alignment: success and retained. Five-run medians improved all four scenarios; estimated gain about 0.6 points.
+- R201 forced top-level OpenMP-clone alignment: small total-score success (+0.29) and retained by rule; S2 improved but S4 needs recovery.
+- Current GitHub best: R201.
+- Current five-run median checkpoint estimate: S1 20.688x, S2 16.016x, S3 59.615x, S4 124.748x, average about 93.92 points.
+- Next plan: preserve the R197/R200 alignment gains, profile or inspect the S4 first-call path, and attempt an S4-local change placed after E=16 hot functions so S1-S3 layout remains stable.

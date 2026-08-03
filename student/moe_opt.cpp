@@ -2611,6 +2611,10 @@ static void compute_routing_int8_amx(const float* x, const MoEWeights& w,
 #endif
 }
 
+#if defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize ("align-functions=64")
+#endif
 __attribute__((noinline, aligned(64)))
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
@@ -2846,3 +2850,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         }
     }
 }
+#if defined(__GNUC__)
+#pragma GCC pop_options
+#endif
