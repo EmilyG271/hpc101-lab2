@@ -2240,6 +2240,8 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
     std::sort(expert_order, expert_order + E, [](int a, int b) {
         return g_expert_token_count[a] > g_expert_token_count[b];
     });
+    // R203: preserve LPT order but avoid libgomp dynamic-workshare overhead.
+    std::atomic<int> next_expert{0};
 
 #pragma omp parallel num_threads(nthreads)
     {
@@ -2258,8 +2260,9 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
             std::memset(y_acc, 0, ystride * sizeof(float));
         char token_init[MAX_NUM_TOKENS] = {0};
 
-#pragma omp for schedule(dynamic)
-        for (int ii = 0; ii < E; ++ii) {
+        for (;;) {
+            const int ii = next_expert.fetch_add(1, std::memory_order_relaxed);
+            if (ii >= E) break;
             const int e = expert_order[ii];
             const int count = g_expert_token_count[e];
             if (count == 0) continue;

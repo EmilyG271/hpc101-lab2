@@ -2848,3 +2848,14 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Three-run median OJ speedups, R201 -> R202: S1 20.968 -> 21.141; S2 15.602 -> 15.450; S3 58.756 -> 49.374; S4 127.401 -> 129.499.
 - S4 improved about 1.65%, but S3 was unstable and two candidate runs were slow (46.71x/49.37x). The extra padding shifts the large `compute_routing_token`/E=16 region even though those entry points remain aligned.
 - Decision: reverted because total score decreased. Direct S4 Router alignment cannot be retained unless the E=16 layout is independently stabilized.
+
+### R203: atomic LPT expert work queue [SUCCESS, kept]
+
+- VTune motivation (R201, S3, 5000 iterations): routed-expert OpenMP body 38.1% CPU, libgomp internal functions 17.9%, AMX matmul 16.4% combined, and memset 7.2%. The existing `schedule(dynamic)` workshare was a major runtime component.
+- Hypothesis: preserve R32's LPT expert order but replace libgomp dynamic scheduling with one shared relaxed atomic index. Eight workers claim the next heavy-first expert via `fetch_add`; the existing explicit barrier before y-acc reduction remains the only completion barrier.
+- Correctness: S1-S4 all passed.
+- Initial three-run A/B showed much better S3 behavior on a noisy allocation, so a separate five-run confirmation was performed.
+- Five-run median OJ speedups, R201 -> R203: S1 21.567 -> 20.532; S2 14.347 -> 16.249; S3 58.495 -> 61.334; S4 130.755 -> 131.517.
+- Relative changes: S1 -4.80%, S2 +13.26%, S3 +4.85%, S4 +0.58%.
+- Checkpoint-interpolated estimated average improved from about 92.42 to 94.64 (+2.22 points). The large S2 gain is a favorable downstream code-layout effect; the intended S3 scheduling gain is also repeatable.
+- Decision: retained as new current best R203 and pushed to GitHub. Next: reduce the atomic queue's S1 layout penalty or further reduce routed-expert memset/reduction cost without restoring libgomp dynamic scheduling.
