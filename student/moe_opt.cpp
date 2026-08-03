@@ -1606,7 +1606,7 @@ alignas(64) static int8_t g_s2_hidden_q[5][MAX_D_FF];
 static float g_s2_hidden_scale[5];
 alignas(64) static int32_t g_s2_down[5][MAX_D_MODEL];
 
-static inline void s2_gate_up_range(
+static inline __attribute__((aligned(64))) void s2_gate_up_range(
     const int8_t* xq, const int8_t* w_gate, const int8_t* w_up,
     const int32_t* sum_gate, const int32_t* sum_up, int32_t* gate_out,
     int32_t* up_out, int begin, int end) {
@@ -1639,7 +1639,7 @@ static inline void s2_gate_up_range(
     }
 }
 
-static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
+static inline __attribute__((aligned(64))) void s2_down_range(const int8_t* hq, const int8_t* w_down,
                                  const int32_t* row_sums, int32_t* down_out,
                                  int begin, int end) {
    const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
@@ -1662,7 +1662,7 @@ static inline void s2_down_range(const int8_t* hq, const int8_t* w_down,
     }
 }
 
-static bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
+static __attribute__((aligned(64))) bool compute_single_token_s2_split(const float* x, const MoEWeights& w,
                                           float* y, int D, int H, int K) {
     constexpr int NUM_EXPERTS = 5;
     constexpr int NUM_CHUNKS = 3;

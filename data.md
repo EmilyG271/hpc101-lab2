@@ -2780,3 +2780,14 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - No candidate was retained. Current GitHub best remains R179.
 - Current measured R179 OJ medians vary strongly by allocation. In the R196 comparison job the medians were S1 21.271x, S2 13.973x, S3 58.452x, S4 132.341x; using the new 60/100/120 checkpoints and piecewise-linear interpolation this is approximately 91.7 average points. The three-run `OJ??.txt` median corresponds to approximately 85.7 points.
 - Next plan: stop runtime-prewarm experiments; use profiling/phase timing to identify S2 and S3 steady-state gaps, then try changes confined after hot code or in existing kernels to avoid layout-induced regressions. S4 already exceeds the 100-point checkpoint and should be guarded against regression.
+
+### R197: 64-byte alignment for S2 VNNI projection path [SUCCESS, kept]
+
+- Hypothesis: binary inspection showed `s2_gate_up_range` at address `...6ca0` (32 bytes off a cache-line boundary) and the S2 OpenMP outlined function at `...6ff0`. Recent experiments also showed strong code-layout sensitivity. Align the S2 Gate/Up, Down and split-entry functions to 64 bytes.
+- Change: add `aligned(64)` attributes to `s2_gate_up_range`, `s2_down_range` and `compute_single_token_s2_split`. The emitted Gate/Up helper moved from `0x6ca0` to `0x6cc0`, a 64-byte boundary.
+- Correctness: S1-S4 all passed.
+- Initial three-run A/B suggested a total-score gain but had an unusually slow baseline S2, so a separate five-run alternating-order confirmation was required.
+- Five-run median OJ speedups, R179 -> R197: S1 21.565 -> 21.701; S2 15.920 -> 16.860; S3 59.473 -> 60.713; S4 132.379 -> 131.867.
+- Relative changes: S1 +0.63%, S2 +5.91%, S3 +2.08%, S4 -0.39%. Using the 60/100/120 checkpoint interpolation, estimated average score improved by about 1.5 points (94.7 -> 96.3 on this allocation).
+- Diagnosis: the S2 VNNI Gate/Up helper is sufficiently front-end/layout sensitive that cache-line alignment gives a repeatable gain. The small S1/S3 gains likely come from favorable downstream layout; S4 is effectively neutral.
+- Decision: retained as the new current best R197 and pushed to GitHub.
