@@ -2741,3 +2741,13 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - S4 median optimized time regressed from 17.5490 ms/10 iterations to 20.4155 ms/10 iterations. All three candidate S4 runs were slower.
 - Diagnosis: eager page commitment is counterproductive. The original first-call parallel memset can obtain fresh demand-zero pages while writing each worker-local slice; pre-touching dirties 16 MiB early, and the subsequent large weight packing evicts those lines so the timed memset must fetch ownership of already-backed pages again.
 - Decision: reverted. Do not pre-touch `y_acc`; isolate the much smaller per-thread scratch/AMX startup next.
+
+### R194: prewarm only large-E thread scratch and AMX permission [FAILED, reverted]
+
+- Hypothesis: avoid R192/R193's harmful `y_acc` pre-touch and move only the much smaller per-thread expert scratch allocation plus AMX permission request out of S4's first timed call.
+- Change: at the start of `preprocess()` for `E>=64`, create an 8-thread team, request AMX permission per worker, and allocate scratch for 16 gathered tokens per expert. No accumulation-pool allocation was moved.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R179 -> R194: S1 21.357 -> 21.043; S2 15.445 -> 15.516; S3 59.214 -> 47.779; S4 128.956 -> 130.369.
+- S4 median optimized time improved slightly from 17.8813 ms to 17.6855 ms, but S3 median regressed from 22.3429 ms to 27.7232 ms even though the new branch is not executed for E=16.
+- Diagnosis: adding a sizable inline block near the beginning of the translation unit shifted the addresses/alignment of later hot helper functions. `moe_forward_optimized` itself is 64-byte aligned, but the S3 router/expert helpers are not; the candidate showed a repeatable code-layout sensitivity in two of three S3 runs.
+- Decision: reverted because total score decreased. Next: keep the same S4-only prewarm idea but place its noinline implementation after all hot kernels, leaving only a small call in `preprocess()`.
