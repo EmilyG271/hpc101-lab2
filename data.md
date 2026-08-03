@@ -2731,3 +2731,13 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - S4 median optimized time regressed from 17.3035 ms/10 iterations to 18.9403 ms/10 iterations. One candidate run reached 15.1714 ms, but the other two were 18.9403/19.0666 ms, so the gain was not stable.
 - Diagnosis: the prewarm was too aggressive. Touching roughly 72 MiB of maximum per-thread scratch plus 16 MiB of `y_acc` at the end of preprocess displaced useful packed/router data and enlarged the active memory footprint. Moving cold work out of the timer is still plausible, but it must happen before weight packing and should be isolated into smaller components.
 - Decision: reverted to R179. Next: pre-touch only the S4 accumulation pool before weight packing, leaving thread scratch demand-sized.
+
+### R193: pre-touch only S4 y_acc before weight packing [FAILED, reverted]
+
+- Hypothesis: R192 was harmed by touching about 72 MiB of maximum thread scratch at the end of preprocess. Isolate only the 16 MiB S4 `y_acc` allocation/first-touch and perform it before all weight packing, so later packing restores cache state.
+- Change: for `E>=64`, allocate the maximum 8-thread accumulation pool and first-touch one slice per OpenMP worker at the start of `preprocess()`. No scratch preallocation and no AMX permission changes.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R179 -> R193: S1 20.755 -> 21.455 (high variance); S2 15.664 -> 15.878; S3 59.740 -> 59.324; S4 130.387 -> 113.177.
+- S4 median optimized time regressed from 17.5490 ms/10 iterations to 20.4155 ms/10 iterations. All three candidate S4 runs were slower.
+- Diagnosis: eager page commitment is counterproductive. The original first-call parallel memset can obtain fresh demand-zero pages while writing each worker-local slice; pre-touching dirties 16 MiB early, and the subsequent large weight packing evicts those lines so the timed memset must fetch ownership of already-backed pages again.
+- Decision: reverted. Do not pre-touch `y_acc`; isolate the much smaller per-thread scratch/AMX startup next.
