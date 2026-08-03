@@ -2712,3 +2712,22 @@ S4 perf topdown: backend-bound 72.5%, retiring 15.7%. The dominant issue is expe
 - No source version was retained; R179 remains current best.
 - The S4 full memset, sequential y_acc reduction, dynamic chunk=1 scheduling, and separate quantization path remain preferable.
 - R191 was also rejected as neutral after reverse-order A/B.
+
+## OJ-Protocol Optimization Session (2026-08-03, R192+)
+
+All candidates in this session are evaluated with the exact OJ normal-mode parameters (no `--benchmark`) on one `hpc submit -p lab2 -c 16` allocation, using alternating baseline/candidate order and three repetitions:
+
+- S1: `1 256 128 16 4 20000`
+- S2: `1 1024 512 16 4 5000`
+- S3: `128 256 128 16 4 200`
+- S4: `1024 512 128 512 2 10`
+
+### R192: move large-E runtime allocation/first-touch into preprocess [FAILED, reverted]
+
+- Hypothesis: OJ does not warm the optimized path, so S4's first timed call pays OpenMP worker startup, per-thread scratch allocation, AMX permission requests, the 16 MiB `y_acc` allocation and page first-touch. With only 10 iterations this cold cost is large.
+- Change: for `E>=64`, `preprocess()` created an 8-thread OpenMP team, requested per-thread AMX permission, allocated each thread's maximum-size `ExpertScratch`, allocated the maximum S4 `y_acc` pool, and first-touched every accumulation slice.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R179 -> R192: S1 21.324 -> 21.719; S2 15.805 -> 16.134; S3 61.721 -> 61.202; S4 132.048 -> 120.775.
+- S4 median optimized time regressed from 17.3035 ms/10 iterations to 18.9403 ms/10 iterations. One candidate run reached 15.1714 ms, but the other two were 18.9403/19.0666 ms, so the gain was not stable.
+- Diagnosis: the prewarm was too aggressive. Touching roughly 72 MiB of maximum per-thread scratch plus 16 MiB of `y_acc` at the end of preprocess displaced useful packed/router data and enlarged the active memory footprint. Moving cold work out of the timer is still plausible, but it must happen before weight packing and should be isolated into smaller components.
+- Decision: reverted to R179. Next: pre-touch only the S4 accumulation pool before weight packing, leaving thread scratch demand-sized.
