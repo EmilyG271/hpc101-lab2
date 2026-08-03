@@ -2760,3 +2760,23 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Three-run median OJ speedups, R179 -> R195: S1 20.707 -> 21.789 (high variance); S2 15.704 -> 14.493; S3 56.811 -> 59.965; S4 132.001 -> 119.848.
 - S4 median optimized time regressed from 17.3284 ms to 19.0471 ms, and S2 also regressed materially. The prewarm's runtime state, not only code layout, is harmful: workers initialized before the long weight-packing phase later enter the timed call in an unfavorable sleep/cache/runtime state.
 - Decision: reverted. Large-E OpenMP/scratch prewarming is exhausted; keep lazy first-call initialization and move to affinity robustness.
+
+### R196: relative-cpuset binding for S1 persistent workers [FAILED, reverted]
+
+- Hypothesis: S1 workers were pinned to absolute CPUs 1-4, but OJ allocations use arbitrary cpusets such as `4-11,52-59`; the calls silently fail and leave placement nondeterministic. Select worker CPUs relative to the process's allowed set while leaving the first allowed physical CPU for the main thread.
+- Change: initialize a worker CPU map from `sched_getaffinity()` before creating the persistent pool, then pin the four workers to allowed CPUs 2-5 in relative order. The main thread was not pinned, avoiding the inherited-affinity correctness bug from R113.
+- Correctness: S1-S4 all passed.
+- Three-run median OJ speedups, R179 -> R196: S1 21.271 -> 16.590; S2 13.973 -> 14.015; S3 58.452 -> 60.055; S4 132.341 -> 128.274.
+- Diagnosis: explicit relative pinning did not stabilize S1. Two candidate runs were slow even though the mapping was valid; leaving workers schedulable over the full 8-core/16-thread allocation is more robust to main-thread placement, SMT sibling selection and instantaneous core frequency. The absolute pin calls often fail, but that failure currently behaves better than forcing this simple relative mapping.
+- Decision: reverted. A future affinity attempt needs topology-aware main+worker placement and a startup readiness protocol, not just the first allowed CPU numbers.
+
+### Five-round report (R192-R196)
+
+- R192 maximum scratch + y_acc + AMX prewarm: failed; S4 median 132.048x -> 120.775x. Excessive 88 MiB first-touch/cache pollution.
+- R193 y_acc-only pre-touch: failed; S4 130.387x -> 113.177x. Eagerly dirtying pages made the later timed memset slower.
+- R194 small scratch/AMX prewarm inline: failed; slight S4 gain but severe S3 code-layout regression.
+- R195 out-of-line scratch/AMX prewarm: failed; S2/S4 regressed, proving the prewarmed runtime state itself was unfavorable after long weight packing.
+- R196 relative cpuset worker binding: failed; S1 became less stable and median performance dropped.
+- No candidate was retained. Current GitHub best remains R179.
+- Current measured R179 OJ medians vary strongly by allocation. In the R196 comparison job the medians were S1 21.271x, S2 13.973x, S3 58.452x, S4 132.341x; using the new 60/100/120 checkpoints and piecewise-linear interpolation this is approximately 91.7 average points. The three-run `OJ??.txt` median corresponds to approximately 85.7 points.
+- Next plan: stop runtime-prewarm experiments; use profiling/phase timing to identify S2 and S3 steady-state gaps, then try changes confined after hot code or in existing kernels to avoid layout-induced regressions. S4 already exceeds the 100-point checkpoint and should be guarded against regression.
