@@ -701,6 +701,10 @@ static inline void compute_routing_int8_vnni(int t, const float* x,
     }
 }
 
+#if defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize ("align-functions=64")
+#endif
 static inline void compute_routing(const float* x, const MoEWeights& w,
                                    int num_tokens, int D, int E, int K) {
 #if defined(_OPENMP)
@@ -708,6 +712,9 @@ static inline void compute_routing(const float* x, const MoEWeights& w,
 #endif
     for (int t = 0; t < num_tokens; ++t) compute_routing_token(t, x, w, D, E, K);
 }
+#if defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 
 /**
  * @brief 将 token 按其 Top-K 路由结果聚拢到各个专家的连续 token 列表中。

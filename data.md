@@ -2806,3 +2806,14 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Three-run median OJ speedups, R197 -> R199: S1 21.045 -> 20.329; S2 15.149 -> 15.566; S3 59.757 -> 59.984; S4 134.575 -> 133.843.
 - The intended S3 gain was only +0.38%, while S1 lost about 3.4%. Estimated total score was neutral to slightly lower despite S2 improving about 2.8%.
 - Decision: reverted. Directly aligning the shared-expert clone is not worth the downstream layout cost; R197 remains best.
+
+### R200: align E=16 Router OpenMP clone [SUCCESS, kept]
+
+- Hypothesis: R197 binary inspection showed the E=16 `compute_routing` OpenMP clone at `0xc0e0`, 32 bytes off a cache-line boundary. S2 and S3 both use this router path.
+- Change: wrap only `compute_routing` with GCC `align-functions=64` push/pop pragmas. The outlined clone moved to aligned address `0xc140`; the top-level forward remained 64-byte aligned.
+- Correctness: S1-S4 all passed.
+- Initial three-run A/B suggested a total-score gain but had high S1/S2 variance, so a separate five-run alternating-order confirmation was performed.
+- Five-run median OJ speedups, R197 -> R200: S1 21.576 -> 21.819; S2 15.463 -> 15.644; S3 59.604 -> 60.445; S4 130.908 -> 131.039.
+- Relative changes: S1 +1.13%, S2 +1.17%, S3 +1.41%, S4 +0.10%. Estimated checkpoint-interpolated average improved by about 0.6 points on this allocation.
+- Diagnosis: aligning the E=16 Router outlined loop improves front-end fetch and also produces a favorable downstream layout without a measurable S4 penalty.
+- Decision: retained as new current best R200 and pushed to GitHub.
