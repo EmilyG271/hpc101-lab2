@@ -2877,3 +2877,11 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Five-run median speedup, R203 -> R204: S1 21.285x -> 20.512x; S2 15.935x -> 16.038x; S3 61.913x -> 71.324x; S4 135.011x -> 134.923x.
 - With the user-provided piecewise-linear checkpoints, the same confirmation allocation estimates average total score 95.11 -> 96.47 (+1.36). The large, repeatable S3 gain outweighs the S1 code-layout regression.
 - Decision: retained as the new current best R204. Next work should preserve this S3 reduction and target the remaining S1 code-layout penalty or reduce S4 first-call variance without reintroducing prewarm/cache-pollution regressions.
+
+### R205: out-of-line R204 reduction to recover code layout [FAILED, reverted]
+
+- Hypothesis: R204's inline S3 AVX-512 reduction enlarged `compute_routed_experts_parallel` and shifted later hot functions, coinciding with its S1 regression. Move only the reduction body to a noinline orphaned OpenMP helper emitted after `moe_forward_optimized`, so S1/S2 layout can return toward R203 while keeping the touched-token algorithm.
+- Correctness: all S1-S4 cases passed.
+- Strict three-run OJ A/B, R204 -> R205 median optimized times: S1 48.665 -> 52.157 ms (-6.7%), S2 196.945 -> 200.425 ms (-1.8%), S3 18.850 -> 18.193 ms (+3.6%), S4 17.702 -> 17.695 ms (noise).
+- Diagnosis: moving the worksharing directive into an out-of-line function improved one S3 sample but did not recover S1 layout and made S2 worse. The call/outlined-function layout costs outweigh the small S3 benefit.
+- Decision: reverted to R204; no five-run confirmation because the three-run total-score signal was negative.
