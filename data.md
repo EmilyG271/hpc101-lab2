@@ -2859,3 +2859,21 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Relative changes: S1 -4.80%, S2 +13.26%, S3 +4.85%, S4 +0.58%.
 - Checkpoint-interpolated estimated average improved from about 92.42 to 94.64 (+2.22 points). The large S2 gain is a favorable downstream code-layout effect; the intended S3 scheduling gain is also repeatable.
 - Decision: retained as new current best R203 and pushed to GitHub. Next: reduce the atomic queue's S1 layout penalty or further reduce routed-expert memset/reduction cost without restoring libgomp dynamic scheduling.
+
+### OJ OpenMP environment audit (2026-08-04) [NO .env retained]
+
+- New evaluator condition: the grader is an Intel Sapphire Rapids allocation with 8 physical cores / 16 hardware threads and does not preconfigure OpenMP variables; an optional root-level `.env` may provide them.
+- Strict simulation used `hpc submit -p lab2 -c 16 --export NONE` and the normal four fixed invocations (no `--benchmark`). A clean job confirmed no `OMP_*`, `GOMP_*`, or `KMP_*` variables are present and received a cpuset such as `4-11,52-59`.
+- Candidate environment: `OMP_NUM_THREADS=16`, `OMP_DYNAMIC=FALSE`, `OMP_PROC_BIND=close`, `OMP_PLACES=cores`. Three alternating fresh-process runs compared it to the completely clean environment. Median optimized times (base -> env) were S1 49.315 -> 49.092 ms, S2 196.744 -> 199.045 ms, S3 21.798 -> 21.804 ms, S4 17.314 -> 17.285 ms.
+- Diagnosis: this source already installs `OMP_PROC_BIND=close` and `OMP_PLACES=cores` through its constructor before the first OpenMP team; all performance-critical teams also specify their required thread counts explicitly. The proposed `.env` therefore only duplicates existing behavior and slightly regressed the S2 median. No `.env` is retained, so the OJ submission remains self-contained in `student/moe_opt.cpp`.
+
+### R204: touched-token y_acc reduction for S3 [SUCCESS, kept]
+
+- Motivation: R203's strict OJ profile still showed routed-expert work and `memset` among the main S3 costs. For S3, every worker's reusable 128 KiB `y_acc` slice lazily writes only the tokens routed to its assigned experts, then explicitly zeroes all remaining rows before the reduction. Those zero writes and later reads are avoidable.
+- Change: for the small-`ystride` lazy path only (S3), maintain a cache-line-aligned per-worker token-touched bitmap. Clear only the 128-byte bitmap at region entry; do not clear untouched `y_acc` rows. After the expert barrier, perform token-row AVX-512 reduction and load a worker slice only when it touched that token. The S4 large-`ystride` full-memset and contiguous reduction path is unchanged.
+- Correctness: all four OJ cases passed in every A/B and confirmation run, with unchanged RMSE.
+- Strict OJ protocol: `hpc submit -p lab2 -c 16 -t 10m --export NONE ~/ab_oj.sh build/lab2_r203 build/lab2_r204 5`; normal mode only, four OJ parameter sets, alternating version order, five fresh-process repetitions in one allocation.
+- Five-run median optimized time, R203 -> R204: S1 48.400 -> 50.386 ms (-4.10%), S2 196.244 -> 194.529 ms (+0.88%), S3 21.383 -> 18.588 ms (+15.04%), S4 17.113 -> 17.140 ms (-0.16%).
+- Five-run median speedup, R203 -> R204: S1 21.285x -> 20.512x; S2 15.935x -> 16.038x; S3 61.913x -> 71.324x; S4 135.011x -> 134.923x.
+- With the user-provided piecewise-linear checkpoints, the same confirmation allocation estimates average total score 95.11 -> 96.47 (+1.36). The large, repeatable S3 gain outweighs the S1 code-layout regression.
+- Decision: retained as the new current best R204. Next work should preserve this S3 reduction and target the remaining S1 code-layout penalty or reduce S4 first-call variance without reintroducing prewarm/cache-pollution regressions.

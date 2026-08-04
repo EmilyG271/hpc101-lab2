@@ -2207,6 +2207,10 @@ static void compute_single_token_routed_experts(
 
 static float* g_yacc_pool = nullptr;
 static size_t g_yacc_cap = 0;
+// R204: S3 lazy accumulation leaves stale rows in each reusable y_acc slice.
+// Track rows actually written by each worker so the reduction can skip them
+// instead of first clearing every untouched row.
+alignas(64) static uint8_t g_yacc_token_touched[8][MAX_NUM_TOKENS];
 static float* acquire_yacc_pool(size_t need_elems) {
     if (need_elems > g_yacc_cap) {
         free(g_yacc_pool);
@@ -2258,7 +2262,9 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
         const bool use_lazy_init = (ystride < 131072);
         if (!use_lazy_init)
             std::memset(y_acc, 0, ystride * sizeof(float));
-        char token_init[MAX_NUM_TOKENS] = {0};
+        uint8_t* token_touched = g_yacc_token_touched[tid];
+        if (use_lazy_init)
+            std::memset(token_touched, 0, (size_t)num_tokens);
 
         for (;;) {
             const int ii = next_expert.fetch_add(1, std::memory_order_relaxed);
@@ -2334,7 +2340,7 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
 #if defined(__AVX512F__)
                 const __m512 dequant_vec = _mm512_set1_ps(dequant);
                 const __m512 weight_vec = _mm512_set1_ps(route_weight);
-                if (!use_lazy_init || token_init[t]) {
+                if (!use_lazy_init || token_touched[t]) {
                     for (int d = 0; d < D; d += 16) {
                         const __m512i out_i32 = _mm512_loadu_si512(out_t + d);
                         const __m512 out_fp32 = _mm512_cvtepi32_ps(out_i32);
@@ -2351,28 +2357,24 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
                         const __m512 contribution = _mm512_mul_ps(weight_vec, dequantized);
                         _mm512_storeu_ps(y_t + d, contribution);
                     }
-                    token_init[t] = 1;
+                    token_touched[t] = 1;
                 }
 #else
-                if (!use_lazy_init || token_init[t]) {
+                if (!use_lazy_init || token_touched[t]) {
                     for (int d = 0; d < D; ++d)
                         y_t[d] += route_weight * ((float)out_t[d] * dequant);
                 } else {
                     for (int d = 0; d < D; ++d)
                         y_t[d] = route_weight * ((float)out_t[d] * dequant);
-                    token_init[t] = 1;
+                    token_touched[t] = 1;
                 }
 #endif
             }
         }
 
-        // R87/R88: Zero untouched tokens (lazy path only), then barrier
-        if (use_lazy_init) {
-            for (int t = 0; t < num_tokens; ++t) {
-                if (!token_init[t])
-                    std::memset(y_acc + (size_t)t * D, 0, D * sizeof(float));
-            }
-        }
+        // R204: the lazy S3 path leaves untouched rows stale. Their
+        // per-worker touched bits are published at this barrier and the
+        // reduction below skips them, avoiding a cache-polluting zero pass.
 #pragma omp barrier
 
 // R18b: threshold-based y_acc reduction.
@@ -2388,12 +2390,34 @@ static void compute_routed_experts_parallel(const MoEWeights& w, float* y,
                     y[idx] += y_acc_th[idx];
             }
         } else {
+            // S3: work in whole token rows so stale, untouched y_acc rows
+            // need neither a memset nor a load during the reduction.
         #pragma omp for schedule(static) nowait
-            for (size_t idx = 0; idx < ystride; ++idx) {
-                float s = 0.0f;
-                for (int th = 0; th < nthreads; ++th)
-                    s += yacc_pool[(size_t)th * ystride + idx];
-                y[idx] += s;
+            for (int t = 0; t < num_tokens; ++t) {
+                float* y_t = y + (size_t)t * D;
+            #if defined(__AVX512F__)
+                for (int d = 0; d < D; d += 16) {
+                    __m512 sum = _mm512_setzero_ps();
+                    for (int th = 0; th < nthreads; ++th) {
+                        if (g_yacc_token_touched[th][t]) {
+                            const float* src = yacc_pool + (size_t)th * ystride +
+                                               (size_t)t * D + d;
+                            sum = _mm512_add_ps(sum, _mm512_loadu_ps(src));
+                        }
+                    }
+                    _mm512_storeu_ps(y_t + d,
+                        _mm512_add_ps(_mm512_loadu_ps(y_t + d), sum));
+                }
+            #else
+                for (int d = 0; d < D; ++d) {
+                    float sum = 0.0f;
+                    for (int th = 0; th < nthreads; ++th) {
+                        if (g_yacc_token_touched[th][t])
+                            sum += yacc_pool[(size_t)th * ystride + (size_t)t * D + d];
+                    }
+                    y_t[d] += sum;
+                }
+            #endif
             }
         }
     }
