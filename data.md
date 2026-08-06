@@ -2885,3 +2885,14 @@ All candidates in this session are evaluated with the exact OJ normal-mode param
 - Strict three-run OJ A/B, R204 -> R205 median optimized times: S1 48.665 -> 52.157 ms (-6.7%), S2 196.945 -> 200.425 ms (-1.8%), S3 18.850 -> 18.193 ms (+3.6%), S4 17.702 -> 17.695 ms (noise).
 - Diagnosis: moving the worksharing directive into an out-of-line function improved one S3 sample but did not recover S1 layout and made S2 worse. The call/outlined-function layout costs outweigh the small S3 benefit.
 - Decision: reverted to R204; no five-run confirmation because the three-run total-score signal was negative.
+
+### R206: persistent 8-way output-sharded S2 engine [SUCCESS, kept]
+
+- Motivation: R204's S2 path created a 15-thread OpenMP team on every forward and used two full-team barriers. The friend's high-performing design suggested assigning stable output-row shards to one thread per physical core and prepacking each shard once in preprocess.
+- Change: added an independently implemented S2-only path for D=1024, H=512, E=16, K=4. Preprocess builds per-expert and shared Gate/Up/Down output-blocked weights for eight row shards and starts seven persistent workers; the caller is participant 0. Each command performs sharded Gate/Up, a global max reduction, sharded hidden quantization, sharded Down, and disjoint output-row merge without an OpenMP fork/join. The old 15-thread implementation remains as fallback.
+- Correctness: S1-S4 all passed in every strict A/B run. S2 RMSE remained 6.88443e-06.
+- Strict OJ protocol: `hpc submit -p lab2 -c 16 -t 10m -n r206-s2-spmd -o r206_s2_spmd.out --export NONE ~/ab_oj.sh build/lab2_r204 build/lab2_s2spmd 5`.
+- Five-run median optimized time, R204 -> R206: S1 48.738 -> 49.335 ms (-1.21%); S2 196.120 -> 156.378 ms (+25.41%); S3 18.322 -> 17.805 ms (+2.90%); S4 17.230 -> 17.063 ms (+0.98%).
+- Five-run median speedup, R204 -> R206: S1 21.241x -> 20.983x; S2 15.749x -> 19.871x; S3 72.640x -> 73.340x; S4 134.065x -> 135.207x.
+- Checkpoint-interpolated estimated average score improved from about 96.95 to 100.98 (+4.03). S2 now exceeds its 120-point checkpoint while the small S1 layout loss is outweighed decisively.
+- Decision: retained as the new current best R206. Next: address S3/S4 parallel-region fusion in a separate candidate.
