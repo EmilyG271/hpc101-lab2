@@ -154,6 +154,27 @@ alignas(64) static int8_t g_s1_shared_gate[S1_PACK_D * S1_PACK_H];
 alignas(64) static int8_t g_s1_shared_up[S1_PACK_D * S1_PACK_H];
 alignas(64) static int8_t g_s1_shared_down[S1_PACK_D * S1_PACK_H];
 
+#if defined(_OPENMP) && defined(__AVX512VNNI__)
+static constexpr int S2_SPMD_D = 1024;
+static constexpr int S2_SPMD_H = 512;
+static constexpr int S2_SPMD_E = 16;
+static constexpr int S2_SPMD_THREADS = 8;
+static constexpr int S2_SPMD_SLOTS = S2_SPMD_E + 1;
+static constexpr int S2_SPMD_H_SHARD = S2_SPMD_H / S2_SPMD_THREADS;
+static constexpr int S2_SPMD_D_SHARD = S2_SPMD_D / S2_SPMD_THREADS;
+static constexpr size_t S2_SPMD_GU_SHARD_ELEMS =
+    (size_t)S2_SPMD_H_SHARD * S2_SPMD_D;
+static constexpr size_t S2_SPMD_DOWN_SHARD_ELEMS =
+    (size_t)S2_SPMD_D_SHARD * S2_SPMD_H;
+
+static int8_t* g_s2_spmd_gate_w = nullptr;
+static int8_t* g_s2_spmd_up_w = nullptr;
+static int8_t* g_s2_spmd_down_w = nullptr;
+static bool g_s2_spmd_ready = false;
+
+static void ensure_s2_spmd_pool();
+#endif
+
 // R10: Router 权重 FP16 存储（带宽降 2x，cvt 后 FP32 计算精度无损）
 alignas(64) static uint16_t g_router_f16[MAX_NUM_EXPERTS * MAX_D_MODEL];
 
@@ -291,6 +312,20 @@ static void pack_s1_output_blocks(const int8_t* src, int8_t* packed,
     }
 }
 
+#if defined(_OPENMP) && defined(__AVX512VNNI__)
+static void pack_s2_spmd_weight(const int8_t* src, int8_t* packed,
+                                int K, int N) {
+    const int rows_per_thread = N / S2_SPMD_THREADS;
+    const size_t shard_elems = (size_t)rows_per_thread * K;
+    for (int participant = 0; participant < S2_SPMD_THREADS; ++participant) {
+        pack_s1_output_blocks(
+            src + (size_t)participant * rows_per_thread * K,
+            packed + (size_t)participant * shard_elems,
+            K, rows_per_thread);
+    }
+}
+#endif
+
 static void compute_output_major_row_sums(const int8_t* src, int32_t* sums,
                                           int K, int N) {
     for (int n = 0; n < N; ++n) {
@@ -399,6 +434,56 @@ void preprocess(MoEWeights& w) {
         pack_s1_output_blocks(w.sh_up, g_s1_shared_up, D, H);
         pack_s1_output_blocks(w.sh_down, g_s1_shared_down, H, D);
     }
+#if defined(_OPENMP) && defined(__AVX512VNNI__)
+    g_s2_spmd_ready = false;
+    if (D == S2_SPMD_D && H == S2_SPMD_H && E == S2_SPMD_E &&
+        w.top_k == MAX_TOP_K) {
+        const size_t gu_total =
+            (size_t)S2_SPMD_THREADS * S2_SPMD_SLOTS *
+            S2_SPMD_GU_SHARD_ELEMS;
+        const size_t down_total =
+            (size_t)S2_SPMD_THREADS * S2_SPMD_SLOTS *
+            S2_SPMD_DOWN_SHARD_ELEMS;
+        if (!g_s2_spmd_gate_w)
+            g_s2_spmd_gate_w = static_cast<int8_t*>(
+                std::aligned_alloc(64, gu_total));
+        if (!g_s2_spmd_up_w)
+            g_s2_spmd_up_w = static_cast<int8_t*>(
+                std::aligned_alloc(64, gu_total));
+        if (!g_s2_spmd_down_w)
+            g_s2_spmd_down_w = static_cast<int8_t*>(
+                std::aligned_alloc(64, down_total));
+        if (g_s2_spmd_gate_w && g_s2_spmd_up_w && g_s2_spmd_down_w) {
+            for (int expert = 0; expert < E; ++expert) {
+                const size_t gu_slot =
+                    (size_t)expert * S2_SPMD_THREADS * S2_SPMD_GU_SHARD_ELEMS;
+                const size_t down_slot =
+                    (size_t)expert * S2_SPMD_THREADS * S2_SPMD_DOWN_SHARD_ELEMS;
+                pack_s2_spmd_weight(
+                    w.w_gate + (size_t)expert * expert_elems,
+                    g_s2_spmd_gate_w + gu_slot, D, H);
+                pack_s2_spmd_weight(
+                    w.w_up + (size_t)expert * expert_elems,
+                    g_s2_spmd_up_w + gu_slot, D, H);
+                pack_s2_spmd_weight(
+                    w.w_down + (size_t)expert * expert_elems,
+                    g_s2_spmd_down_w + down_slot, H, D);
+            }
+            const size_t shared_gu_slot =
+                (size_t)S2_SPMD_E * S2_SPMD_THREADS * S2_SPMD_GU_SHARD_ELEMS;
+            const size_t shared_down_slot =
+                (size_t)S2_SPMD_E * S2_SPMD_THREADS * S2_SPMD_DOWN_SHARD_ELEMS;
+            pack_s2_spmd_weight(
+                w.sh_gate, g_s2_spmd_gate_w + shared_gu_slot, D, H);
+            pack_s2_spmd_weight(
+                w.sh_up, g_s2_spmd_up_w + shared_gu_slot, D, H);
+            pack_s2_spmd_weight(
+                w.sh_down, g_s2_spmd_down_w + shared_down_slot, H, D);
+            g_s2_spmd_ready = true;
+            ensure_s2_spmd_pool();
+        }
+    }
+#endif
     g_scale_shared_gate = w.sh_s_gate;
     g_scale_shared_up = w.sh_s_up;
     g_scale_shared_down = w.sh_s_down;
@@ -1756,6 +1841,197 @@ static __attribute__((aligned(64))) bool compute_single_token_s2_split(const flo
     }
     return true;
 }
+
+alignas(64) static float g_s2_spmd_local_max[S2_SPMD_THREADS][16];
+static float g_s2_spmd_gate_scale[5];
+static float g_s2_spmd_up_scale[5];
+static float g_s2_spmd_down_scale[5];
+static float g_s2_spmd_route_scale[5];
+static float g_s2_spmd_quant_rcp[5];
+static int g_s2_spmd_weight_slot[5];
+static const float* g_s2_spmd_input = nullptr;
+static float* g_s2_spmd_output = nullptr;
+
+static std::thread g_s2_spmd_workers[S2_SPMD_THREADS - 1];
+static std::atomic<uint32_t> g_s2_spmd_epoch{0};
+static std::atomic<uint32_t> g_s2_spmd_done[S2_SPMD_THREADS - 1];
+static std::atomic<int> g_s2_spmd_started{0};
+static std::atomic<int> g_s2_spmd_barrier_count{0};
+static std::atomic<uint32_t> g_s2_spmd_barrier_phase{0};
+static bool g_s2_spmd_pool_started = false;
+
+static inline void s2_spmd_barrier() {
+    const uint32_t phase =
+        g_s2_spmd_barrier_phase.load(std::memory_order_relaxed);
+    if (g_s2_spmd_barrier_count.fetch_add(1, std::memory_order_acq_rel) ==
+        S2_SPMD_THREADS - 1) {
+        g_s2_spmd_barrier_count.store(0, std::memory_order_relaxed);
+        g_s2_spmd_barrier_phase.fetch_add(1, std::memory_order_release);
+    } else {
+        while (g_s2_spmd_barrier_phase.load(std::memory_order_acquire) == phase)
+            _mm_pause();
+    }
+}
+
+static inline void s2_spmd_participant(int participant) {
+    const int h_begin = participant * S2_SPMD_H_SHARD;
+    const int d_begin = participant * S2_SPMD_D_SHARD;
+
+    for (int slot = 0; slot < 5; ++slot) {
+        const int weight_slot = g_s2_spmd_weight_slot[slot];
+        const size_t packed_index =
+            ((size_t)weight_slot * S2_SPMD_THREADS + participant) *
+            S2_SPMD_GU_SHARD_ELEMS;
+        const int32_t* gate_sum = weight_slot == S2_SPMD_E
+            ? g_sum_shared_gate : g_sum_gate[weight_slot];
+        const int32_t* up_sum = weight_slot == S2_SPMD_E
+            ? g_sum_shared_up : g_sum_up[weight_slot];
+        s1_blocked_gate_up(
+            g_quantized_x, g_s2_spmd_gate_w + packed_index,
+            g_s2_spmd_up_w + packed_index, gate_sum + h_begin,
+            up_sum + h_begin, g_s2_gate[slot] + h_begin,
+            g_s2_up[slot] + h_begin, S2_SPMD_D, S2_SPMD_H_SHARD);
+
+        const __m512 gate_scale = _mm512_set1_ps(
+            g_s2_spmd_gate_scale[slot] * g_x_scale[0]);
+        const __m512 up_scale = _mm512_set1_ps(
+            g_s2_spmd_up_scale[slot] * g_x_scale[0]);
+        __m512 max_abs = _mm512_setzero_ps();
+        for (int h = h_begin; h < h_begin + S2_SPMD_H_SHARD; h += 16) {
+            const __m512 gate = _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_load_si512(g_s2_gate[slot] + h)),
+                gate_scale);
+            const __m512 up = _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_load_si512(g_s2_up[slot] + h)),
+                up_scale);
+            const __m512 hidden = _mm512_mul_ps(silu512_ps(gate), up);
+            _mm512_store_ps(g_s2_hidden[slot] + h, hidden);
+            max_abs = _mm512_max_ps(max_abs, _mm512_abs_ps(hidden));
+        }
+        g_s2_spmd_local_max[participant][slot] =
+            _mm512_reduce_max_ps(max_abs);
+    }
+
+    s2_spmd_barrier();
+    if (participant == 0) {
+        for (int slot = 0; slot < 5; ++slot) {
+            float max_abs = g_s2_spmd_local_max[0][slot];
+            for (int part = 1; part < S2_SPMD_THREADS; ++part)
+                max_abs = std::max(max_abs, g_s2_spmd_local_max[part][slot]);
+            g_s2_hidden_scale[slot] =
+                max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+            g_s2_spmd_quant_rcp[slot] =
+                max_abs > 0.0f ? 127.0f / max_abs : 1.0f;
+        }
+    }
+    s2_spmd_barrier();
+
+    const __m512 quant_lo = _mm512_set1_ps(-127.0f);
+    const __m512 quant_hi = _mm512_set1_ps(127.0f);
+    for (int slot = 0; slot < 5; ++slot) {
+        const __m512 quant_rcp = _mm512_set1_ps(g_s2_spmd_quant_rcp[slot]);
+        for (int h = h_begin; h < h_begin + S2_SPMD_H_SHARD; h += 16) {
+            __m512 quantized = _mm512_mul_ps(
+                _mm512_load_ps(g_s2_hidden[slot] + h), quant_rcp);
+            quantized = _mm512_roundscale_ps(
+                quantized, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            quantized = _mm512_min_ps(
+                quant_hi, _mm512_max_ps(quant_lo, quantized));
+            _mm_store_si128(
+                reinterpret_cast<__m128i*>(g_s2_hidden_q[slot] + h),
+                _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(quantized)));
+        }
+    }
+    s2_spmd_barrier();
+
+    for (int slot = 0; slot < 5; ++slot) {
+        const int weight_slot = g_s2_spmd_weight_slot[slot];
+        const size_t packed_index =
+            ((size_t)weight_slot * S2_SPMD_THREADS + participant) *
+            S2_SPMD_DOWN_SHARD_ELEMS;
+        const int32_t* down_sum = weight_slot == S2_SPMD_E
+            ? g_sum_shared_down : g_sum_down[weight_slot];
+        s1_blocked_matmul(
+            g_s2_hidden_q[slot], g_s2_spmd_down_w + packed_index,
+            down_sum + d_begin, g_s2_down[slot] + d_begin,
+            S2_SPMD_H, S2_SPMD_D_SHARD);
+    }
+
+    __m512 dequant[5];
+    for (int slot = 0; slot < 5; ++slot) {
+        dequant[slot] = _mm512_set1_ps(
+            g_s2_hidden_scale[slot] * g_s2_spmd_down_scale[slot] *
+            g_s2_spmd_route_scale[slot]);
+    }
+    for (int d = d_begin; d < d_begin + S2_SPMD_D_SHARD; d += 16) {
+        __m512 result = _mm512_loadu_ps(g_s2_spmd_input + d);
+        for (int slot = 0; slot < 5; ++slot) {
+            result = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_load_si512(g_s2_down[slot] + d)),
+                dequant[slot], result);
+        }
+        _mm512_storeu_ps(g_s2_spmd_output + d, result);
+    }
+}
+
+static void s2_spmd_worker_loop(int participant) {
+    uint32_t seen = g_s2_spmd_epoch.load(std::memory_order_relaxed);
+    g_s2_spmd_started.fetch_add(1, std::memory_order_release);
+    for (;;) {
+        uint32_t current;
+        while ((current = g_s2_spmd_epoch.load(std::memory_order_acquire)) == seen)
+            _mm_pause();
+        seen = current;
+        s2_spmd_participant(participant);
+        g_s2_spmd_done[participant - 1].store(current, std::memory_order_release);
+    }
+}
+
+static void ensure_s2_spmd_pool() {
+    if (g_s2_spmd_pool_started) return;
+    g_s2_spmd_pool_started = true;
+    for (int participant = 1; participant < S2_SPMD_THREADS; ++participant) {
+        g_s2_spmd_workers[participant - 1] =
+            std::thread(s2_spmd_worker_loop, participant);
+        g_s2_spmd_workers[participant - 1].detach();
+    }
+    while (g_s2_spmd_started.load(std::memory_order_acquire) !=
+           S2_SPMD_THREADS - 1)
+        _mm_pause();
+}
+
+static bool compute_single_token_s2_spmd(
+    const float* x, const MoEWeights& w, float* y, int D, int H, int K) {
+    if (!g_s2_spmd_ready || D != S2_SPMD_D || H != S2_SPMD_H ||
+        w.num_experts != S2_SPMD_E || K != MAX_TOP_K ||
+        get_num_procs_cached() < S2_SPMD_THREADS)
+        return false;
+
+    g_s2_spmd_weight_slot[0] = S2_SPMD_E;
+    g_s2_spmd_gate_scale[0] = g_scale_shared_gate;
+    g_s2_spmd_up_scale[0] = g_scale_shared_up;
+    g_s2_spmd_down_scale[0] = g_scale_shared_down;
+    g_s2_spmd_route_scale[0] = 1.0f;
+    for (int slot = 1; slot < 5; ++slot) {
+        const int expert = g_topk_indices[0][slot - 1];
+        g_s2_spmd_weight_slot[slot] = expert;
+        g_s2_spmd_gate_scale[slot] = g_scale_gate[expert];
+        g_s2_spmd_up_scale[slot] = g_scale_up[expert];
+        g_s2_spmd_down_scale[slot] = g_scale_down[expert];
+        g_s2_spmd_route_scale[slot] = g_topk_weights[0][slot - 1];
+    }
+    g_s2_spmd_input = x;
+    g_s2_spmd_output = y;
+
+    const uint32_t target =
+        g_s2_spmd_epoch.fetch_add(1, std::memory_order_release) + 1;
+    s2_spmd_participant(0);
+    for (int worker = 0; worker < S2_SPMD_THREADS - 1; ++worker) {
+        while (g_s2_spmd_done[worker].load(std::memory_order_acquire) != target)
+            _mm_pause();
+    }
+    return true;
+}
 #endif
 
 // R102: Persistent thread pool for S1 — eliminates OMP fork/join overhead.
@@ -2753,6 +3029,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 #if defined(_OPENMP)
     if (num_tokens == 1) {
 #if defined(__AVX512VNNI__)
+        if (compute_single_token_s2_spmd(x, w, y, D, H, K)) return;
         if (compute_single_token_s2_split(x, w, y, D, H, K)) return;
 #endif
         int k_threads = K + 1;
